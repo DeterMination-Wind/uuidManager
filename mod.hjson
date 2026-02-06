@@ -1,0 +1,27 @@
+# the mod name as displayed in-game
+displayName: "UUID Manager"
+
+# the internal name of your mod
+name: "uuidmanager"
+
+# the mod version
+version: 1.0.0
+
+# the minimum game build required to run this mod
+minGameVersion: 154
+
+# hidden mods are client/server side only and won't be required for multiplayer compatibility checks
+hidden: true
+
+# your name
+author: "(local)"
+
+# the mod description as seen in the mod dialog
+description: "
+Client-side UUID/UID manager.
+
+- Edit your UUID under the player name in the Join Game dialog
+- Save multiple UUIDs with notes and quick-switch
+- Auto-calculate UID from UUID
+- Per-server UUID auto switch
+"

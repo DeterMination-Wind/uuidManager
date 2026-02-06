@@ -1,0 +1,76 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build artifacts
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon distAll
+
+      - name: Resolve version
+        id: version
+        run: |
+          version=$(grep -E '^version:' mod.hjson | head -n1 | cut -d':' -f2- | tr -d '[:space:]')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes body
+        run: |
+          prev_tag=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          {
+            echo "## UUID Manager v${{ steps.version.outputs.version }}"
+            echo
+            echo "### Changelog"
+            if [ -n "$prev_tag" ]; then
+              git log --no-merges --pretty=format:'- %s (%h)' "$prev_tag..${GITHUB_REF_NAME}" || true
+            else
+              git log --no-merges --pretty=format:'- %s (%h)' || true
+            fi
+            echo
+            echo
+            echo "### Build"
+            echo "- Mindustry min version: 154"
+          } > RELEASE_NOTES.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uuidmanager-${{ steps.version.outputs.version }}
+          path: |
+            build/libs/uuidmanager.zip
+            build/libs/uuidmanager.jar
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/uuidmanager.zip
+            build/libs/uuidmanager.jar
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true

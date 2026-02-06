@@ -1,0 +1,123 @@
+plugins {
+    id "base"
+}
+
+// This project is a JS/asset-only Mindustry mod.
+// We package the mod folder contents into two artifacts:
+// - <name>.zip : desktop-friendly distribution
+// - <name>.jar : same content, .jar extension for convenience
+
+def modHjson = file("mod.hjson")
+if(!modHjson.exists()){
+    throw new GradleException("mod.hjson not found in: ${project.projectDir}")
+}
+
+def modText = modHjson.getText("UTF-8")
+
+def readHjsonScalar = { String key ->
+    // Matches: key: value  OR  key: "value" (single-line only)
+    def m = (modText =~ /(?m)^\s*${java.util.regex.Pattern.quote(key)}\s*:\s*\"?([^\"\s]+)\"?\s*$/)
+    return m.find() ? m.group(1) : null
+}
+
+def modInternalName = readHjsonScalar("name") ?: project.name
+def modVersion = readHjsonScalar("version") ?: "0.0.0"
+
+version = modVersion
+
+def distIncludes = [
+    "mod.hjson",
+    "mod.json",
+    "icon.png",
+    "scripts/**",
+    "bundles/**",
+    "content/**",
+    "sprites/**",
+    "sounds/**",
+    "maps/**",
+    "schematics/**",
+]
+
+def libsDir = layout.buildDirectory.dir("libs")
+
+tasks.register("distZip", Zip){
+    group = "build"
+    description = "Packages the mod as a .zip for Mindustry (desktop-friendly)."
+
+    archiveFileName.set("${modInternalName}.zip")
+    destinationDirectory.set(libsDir)
+
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+
+    from(projectDir){
+        include(distIncludes)
+    }
+}
+
+tasks.register("distJar", Zip){
+    group = "build"
+    description = "Packages the mod as a .jar (zip format; convenient on some platforms)."
+
+    archiveFileName.set("${modInternalName}.jar")
+    destinationDirectory.set(libsDir)
+
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+
+    from(projectDir){
+        include(distIncludes)
+    }
+}
+
+tasks.register("distAll"){
+    group = "build"
+    description = "Builds both .zip and .jar distributions."
+    dependsOn tasks.named("distZip"), tasks.named("distJar")
+}
+
+// Compatibility aliases: match the common Mindustry mod Gradle workflow.
+// In many Java mods, `jar` builds a .zip for distribution and `jarAndroid` builds an Android jar.
+// Here they map to the asset-only dist tasks.
+tasks.register("jar"){
+    group = "build"
+    description = "Alias of distZip (outputs <name>.zip)."
+    dependsOn tasks.named("distZip")
+}
+
+tasks.register("jarAndroid"){
+    group = "build"
+    description = "Alias of distJar (outputs <name>.jar)."
+    dependsOn tasks.named("distJar")
+}
+
+// Keep a copy in workspace root "构建/" (mod name + version), like other mods in this workspace.
+def buildOutDir = new File(rootDir.parentFile, "构建")
+
+tasks.register("copyZipToBuildDir", Copy){
+    doNotTrackState("Copies into workspace build folder for convenience.")
+    dependsOn tasks.named("distZip")
+    from(tasks.named("distZip").flatMap{ it.archiveFile })
+    into(buildOutDir)
+    rename{ _ -> "${modInternalName}-${project.version}.zip" }
+}
+
+tasks.register("copyJarToBuildDir", Copy){
+    doNotTrackState("Copies into workspace build folder for convenience.")
+    dependsOn tasks.named("distJar")
+    from(tasks.named("distJar").flatMap{ it.archiveFile })
+    into(buildOutDir)
+    rename{ _ -> "${modInternalName}-${project.version}.jar" }
+}
+
+tasks.named("distZip").configure{
+    finalizedBy tasks.named("copyZipToBuildDir")
+}
+
+tasks.named("distJar").configure{
+    finalizedBy tasks.named("copyJarToBuildDir")
+}
+
+tasks.named("assemble").configure{
+    dependsOn tasks.named("distAll")
+}

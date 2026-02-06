@@ -1,0 +1,41 @@
+# UUID Manager
+
+Client-side UUID/UID manager for Mindustry 154.3.
+
+Current version: `v1.0.0`
+
+## Features
+
+- Edit `UUID` (8-byte Base64) directly under player name in Join Game.
+- Live preview of `UID` (3-char shortID) and `UID(SHA1)`.
+- Save multiple UUIDs with notes and quick switching.
+- Per-server auto-switch by exact `ip:port`.
+- Built-in UID database:
+  - Run `Bruteforce all 3-char UIDs (8s)` from settings.
+  - Query from settings or directly in Join Game after DB build.
+
+## Install
+
+Import built artifacts into Mindustry mods folder:
+
+- Recommended: `构建/uuidmanager-1.0.0.zip`
+- Alternative: `构建/uuidmanager-1.0.0.jar`
+
+## Build Locally
+
+Run in `uuidManager/`:
+
+```bash
+./gradlew distAll
+```
+
+Outputs:
+
+- `build/libs/uuidmanager.zip`
+- `build/libs/uuidmanager.jar`
+- versioned copies in workspace root `构建/`.
+
+## Notes
+
+- This is a client-side tool; matching UUID does not automatically grant admin rights.
+- Approval code is cached after first successful validation.
