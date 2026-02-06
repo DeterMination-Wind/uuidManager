@@ -219,12 +219,105 @@ function getUidDbFi(){
 function uidDbMetaText(db){
     const m = (db && db.meta) ? db.meta : {};
     const found = Number(m.foundCount || 0);
+    const longIds = Number(m.longIdCount || 0);
     const total = Number(m.targetCount || 0);
     const timeout = Number(m.excludedTimeoutCount || 0);
     const cores = Number(m.cores || 0);
     const checked = Number(m.checked || 0);
-    return "\u6570\u636e\u6761\u76ee: " + found + "/" + total + "  |  \u8d85\u65f6\u6392\u9664: " + timeout + "\n" +
+    return "\u77edUID\u8986\u76d6: " + found + "/" + total + "  |  \u957fid\u603b\u6570: " + longIds + "  |  \u8d85\u65f6\u6392\u9664: " + timeout + "\n" +
         "\u4e0a\u6b21\u6784\u5efa\u6838\u5fc3\u6570: " + cores + "  |  \u5c1d\u8bd5\u6b21\u6570: " + checked;
+}
+
+function normalizeUidKey(uid3){
+    const k = sanitizeIdText(uid3);
+    return k.length === 3 ? k : "";
+}
+
+function uidListFromRaw(raw){
+    const out = [];
+    if(raw == null) return out;
+
+    if(Array.isArray(raw)){
+        for(let i = 0; i < raw.length; i++){
+            const v = sanitizeIdText(raw[i]);
+            if(v.length > 0) out.push(v);
+        }
+        return out;
+    }
+
+    const s = sanitizeIdText(raw);
+    if(s.length > 0) out.push(s);
+    return out;
+}
+
+function ensureUidList(db, key){
+    const k = normalizeUidKey(key);
+    if(k.length !== 3) return [];
+
+    let list = db.map[k];
+    if(Array.isArray(list)) return list;
+
+    list = uidListFromRaw(list);
+    db.map[k] = list;
+    return list;
+}
+
+function addUidPair(db, uid3, uuid8){
+    const key = normalizeUidKey(uid3);
+    const val = sanitizeIdText(uuid8);
+    if(key.length !== 3 || val.length === 0) return false;
+
+    const list = ensureUidList(db, key);
+    for(let i = 0; i < list.length; i++){
+        if(list[i] === val) return false;
+    }
+    list.push(val);
+    return true;
+}
+
+function getUidListByUid(uid3){
+    const key = normalizeUidKey(uid3);
+    if(key.length !== 3) return [];
+
+    const db = loadUidDb();
+    const raw = db.map[key];
+    if(Array.isArray(raw)) return raw;
+    return uidListFromRaw(raw);
+}
+
+function recomputeUidDbMeta(db, patch){
+    const targetInfo = getAllUidTargets();
+    const meta = db.meta || {};
+
+    let foundCount = 0;
+    let longIdCount = 0;
+    for(let i = 0; i < targetInfo.targets.length; i++){
+        const key = targetInfo.targets[i];
+        const list = uidListFromRaw(db.map[key]);
+        if(list.length > 0){
+            foundCount++;
+            longIdCount += list.length;
+            db.map[key] = list;
+        }
+    }
+
+    db.meta = {
+        targetCount: targetInfo.targets.length,
+        foundCount: foundCount,
+        excludedSpecialCount: targetInfo.excludedSpecial,
+        excludedTimeoutCount: Math.max(0, targetInfo.targets.length - foundCount),
+        longIdCount: longIdCount,
+        checked: Number(meta.checked || 0),
+        cores: Number(meta.cores || 0),
+        lastBuildAt: Number(meta.lastBuildAt || 0),
+        lastBuildSec: Number(meta.lastBuildSec || 8)
+    };
+
+    if(patch && typeof patch === "object"){
+        for(var k in patch){
+            if(Object.prototype.hasOwnProperty.call(patch, k)) db.meta[k] = patch[k];
+        }
+    }
 }
 
 function getUidDbMetaText(){
@@ -262,17 +355,28 @@ function loadUidDb(){
     if(typeof db.map !== "object" || db.map == null || Array.isArray(db.map)) db.map = {};
     if(typeof db.meta !== "object" || db.meta == null) db.meta = defaultUidDb().meta;
 
-    // Ensure values are plain strings and keys are 3-char IDs.
+    // Ensure values are arrays of plain strings and keys are 3-char IDs.
     const clean = {};
     for(var k in db.map){
         if(!Object.prototype.hasOwnProperty.call(db.map, k)) continue;
-        const key = sanitizeIdText(k);
+        const key = normalizeUidKey(k);
         if(key.length !== 3) continue;
-        const val = sanitizeIdText(db.map[k]);
-        if(val.length === 0) continue;
-        clean[key] = val;
+        const list = uidListFromRaw(db.map[k]);
+        if(list.length === 0) continue;
+
+        const uniq = [];
+        for(let i = 0; i < list.length; i++){
+            const v = list[i];
+            let exists = false;
+            for(let j = 0; j < uniq.length; j++){
+                if(uniq[j] === v){ exists = true; break; }
+            }
+            if(!exists) uniq.push(v);
+        }
+        clean[key] = uniq;
     }
     db.map = clean;
+    recomputeUidDbMeta(db);
 
     // One-time migration from Arc settings string storage to external JSON file.
     if(migratedFromSettings){
@@ -365,10 +469,8 @@ function getAllUidTargets(){
 }
 
 function lookupUuid8ByUid(uid3){
-    const key = sanitizeIdText(uid3);
-    if(key.length !== 3) return "";
-    const db = loadUidDb();
-    return sanitizeIdText(db.map[key] || "");
+    const list = getUidListByUid(uid3);
+    return list.length > 0 ? sanitizeIdText(list[0]) : "";
 }
 
 function sanitizeIdText(text){
@@ -609,30 +711,21 @@ function buildUidDbAll8s(onDone){
                 try{
                     const db = loadUidDb();
                     const iter = foundMap.entrySet().iterator();
+                    let addedPairs = 0;
                     while(iter.hasNext()){
                         const e = iter.next();
                         const k = "" + e.getKey();
                         const v = "" + e.getValue();
-                        if(!(k in db.map)) db.map[k] = v;
+                        if(addUidPair(db, k, v)) addedPairs++;
                     }
 
-                    const targetInfo = getAllUidTargets();
-                    const targets = targetInfo.targets;
-                    let foundCount = 0;
-                    for(let i = 0; i < targets.length; i++){
-                        if(db.map[targets[i]]) foundCount++;
-                    }
-
-                    db.meta = {
-                        targetCount: targets.length,
-                        foundCount: foundCount,
-                        excludedSpecialCount: targetInfo.excludedSpecial,
-                        excludedTimeoutCount: Math.max(0, targets.length - foundCount),
+                    recomputeUidDbMeta(db, {
                         checked: Number(checked.get()),
                         cores: cores,
                         lastBuildAt: Number(System.currentTimeMillis()),
-                        lastBuildSec: 8
-                    };
+                        lastBuildSec: 8,
+                        lastAddedPairs: addedPairs
+                    });
 
                     const saved = saveUidDb(db);
                     _uidBuildRunning = false;
@@ -653,21 +746,181 @@ function buildUidDbAll8s(onDone){
     waiterThread.start();
 }
 
+function tryCollectImportedPairsFromObject(obj, out){
+    if(obj == null || typeof obj !== "object") return;
+
+    if(Array.isArray(obj)){
+        for(let i = 0; i < obj.length; i++){
+            const it = obj[i];
+            if(it == null) continue;
+            if(typeof it === "string") continue;
+            if(typeof it !== "object") continue;
+
+            const uid = normalizeUidKey(it.uid3 || it.uid || it.id || it.shortId || it.shortid || "");
+            const raw = it.uuid8 || it.uuid || it.longUuid || it.longuuid || it.value || "";
+            if(uid.length === 3 && ("" + raw).length > 0){
+                out.push({uid: uid, raw: "" + raw});
+            }
+        }
+        return;
+    }
+
+    if(obj.map && typeof obj.map === "object"){
+        const mp = obj.map;
+        for(var k in mp){
+            if(!Object.prototype.hasOwnProperty.call(mp, k)) continue;
+            const uid = normalizeUidKey(k);
+            if(uid.length !== 3) continue;
+            const vals = uidListFromRaw(mp[k]);
+            for(let i = 0; i < vals.length; i++){
+                out.push({uid: uid, raw: vals[i]});
+            }
+        }
+    }
+}
+
+function tryCollectImportedPairsFromLines(text, out){
+    const lines = ("" + text).split(/\r?\n/);
+    for(let i = 0; i < lines.length; i++){
+        const ln = lines[i].trim();
+        if(ln.length === 0) continue;
+        if(ln.startsWith("#")) continue;
+
+        // Accept formats like:
+        // uid uuid
+        // uid: uuid
+        // uid => uuid
+        const m = ln.match(/^([^\s:=><,]{3})\s*(?:[:=><,\-]+\s*)?([A-Za-z0-9+/=]+)$/);
+        if(m == null) continue;
+
+        const uid = normalizeUidKey(m[1]);
+        const raw = sanitizeIdText(m[2]);
+        if(uid.length !== 3 || raw.length === 0) continue;
+        out.push({uid: uid, raw: raw});
+    }
+}
+
+function importUidDbText(payload){
+    const text = ("" + (payload == null ? "" : payload)).trim();
+    if(text.length === 0){
+        return {ok: false, message: "\u7c98\u8d34\u677f\u4e3a\u7a7a"};
+    }
+
+    const pairs = [];
+    let jsonObj = null;
+    try{
+        jsonObj = JSON.parse(text);
+    }catch(e){
+        jsonObj = null;
+    }
+
+    if(jsonObj != null){
+        tryCollectImportedPairsFromObject(jsonObj, pairs);
+    }else{
+        tryCollectImportedPairsFromLines(text, pairs);
+    }
+
+    if(pairs.length === 0){
+        return {ok: false, message: "\u672a\u8bc6\u522b\u5230\u53ef\u5bfc\u5165\u8bb0\u5f55"};
+    }
+
+    const db = loadUidDb();
+    let added = 0;
+    let duplicate = 0;
+    let invalid = 0;
+    let mismatch = 0;
+
+    for(let i = 0; i < pairs.length; i++){
+        const p = pairs[i];
+        const norm = normalizeUuidOrUid(p.raw);
+        if(!norm.valid){
+            invalid++;
+            continue;
+        }
+
+        const uuid8 = norm.uuid8;
+        const sid = getUidShortForUuid8(uuid8);
+        if(sid !== p.uid){
+            mismatch++;
+            continue;
+        }
+
+        if(addUidPair(db, p.uid, uuid8)){
+            added++;
+        }else{
+            duplicate++;
+        }
+    }
+
+    recomputeUidDbMeta(db, {
+        lastImportAt: Number(System.currentTimeMillis()),
+        lastImportAdded: added,
+        lastImportDuplicate: duplicate,
+        lastImportInvalid: invalid,
+        lastImportMismatch: mismatch
+    });
+
+    const saved = saveUidDb(db);
+    return {
+        ok: saved,
+        added: added,
+        duplicate: duplicate,
+        invalid: invalid,
+        mismatch: mismatch,
+        totalParsed: pairs.length,
+        message: saved ? "\u5bfc\u5165\u5b8c\u6210" : "\u5bfc\u5165\u6210\u529f\u4f46\u4fdd\u5b58\u5931\u8d25"
+    };
+}
+
+function showUidDbMatchListDialog(uid3, list){
+    const dialog = new BaseDialog("UID\u67e5\u8be2: " + uid3);
+    dialog.addCloseButton();
+    dialog.closeOnBack();
+
+    dialog.cont.table(cons(t => {
+        t.left();
+        t.defaults().left().pad(4);
+        t.add("\u5339\u914d\u5230\u957fid\u6570\u91cf: " + list.length).color(Pal.accent).row();
+    })).growX().padBottom(8).row();
+
+    const content = new Packages.arc.scene.ui.layout.Table();
+    content.top().left();
+    content.defaults().growX().left();
+
+    if(list.length === 0){
+        content.add("\u65e0\u5339\u914d\u7ed3\u679c").color(Pal.gray).left();
+    }else{
+        for(let i = 0; i < list.length; i++){
+            const v = "" + list[i];
+            content.table(Tex.whiteui, cons(row => {
+                row.left();
+                row.defaults().pad(4).left();
+                row.add(v).color(Pal.lightishGray).growX();
+                row.button(Icon.copySmall, Styles.cleari, () => {
+                    Core.app.setClipboardText(v);
+                    popupInfo("\u60a8\u5df2\u590d\u5236");
+                }).size(44);
+            })).padBottom(6).growX();
+            content.row();
+        }
+    }
+
+    dialog.cont.pane(cons(p => {
+        p.add(content).growX();
+    })).grow().row();
+
+    dialog.show();
+}
+
 function showUidDbLookupDialog(){
     showPrompt("UID\u6570\u636e\u5e93\u67e5\u8be2", "\u8f93\u51653\u4f4dUID", "", uid => {
-        const key = sanitizeIdText(uid);
+        const key = normalizeUidKey(uid);
         if(key.length !== 3){
             popupInfo("\u8bf7\u8f93\u51653\u4f4dUID");
             return;
         }
-        const uuid8 = lookupUuid8ByUid(key);
-        if(uuid8.length === 0){
-            popupInfo("\u6570\u636e\u5e93\u672a\u547d\u4e2d: " + key);
-            return;
-        }
-
-        Core.app.setClipboardText(uuid8);
-        popupInfo("\u60a8\u5df2\u590d\u5236");
+        const list = getUidListByUid(key);
+        showUidDbMatchListDialog(key, list);
     });
 }
 
@@ -1340,12 +1593,14 @@ function injectJoinDialogRow(){
             ensureApprovedWithWarning(() => {
                 queryButton.setDisabled(true);
                 try{
-                    const uuid8 = lookupUuid8ByUid(target);
-                    if(uuid8.length === 0){
+                    const list = getUidListByUid(target);
+                    if(list.length === 0){
                         statusLabel.setText("[scarlet]\u6570\u636e\u5e93\u672a\u547d\u4e2d\uff0c\u8bf7\u5148\u5728\u8bbe\u7f6e\u91cc\u7a77\u4e3e[]");
                         statusLabel.setColor(Pal.remove);
                         return;
                     }
+
+                    const uuid8 = "" + list[0];
 
                     Core.app.setClipboardText(uuid8);
 
@@ -1355,7 +1610,7 @@ function injectJoinDialogRow(){
                     suppress = false;
                     setFromText(uuid8, false);
 
-                    statusLabel.setText("[accent]\u6570\u636e\u5e93\u547d\u4e2d\u5e76\u590d\u5236: " + uuid8 + "[]");
+                    statusLabel.setText("[accent]\u6570\u636e\u5e93\u547d\u4e2d(" + list.length + ")\u5e76\u590d\u5236: " + uuid8 + "[]");
                     statusLabel.setColor(Pal.accent);
                     toast("\u5df2\u4eceUID\u6570\u636e\u5e93\u590d\u5236UUID");
                 }finally{
@@ -1415,14 +1670,24 @@ function addSettingsCategory(){
             ensureApprovedWithWarning(() => {
                 buildUidDbAll8s(result => {
                     if(!result || !result.ok){
-                        toast("[scarlet]UID\u6570\u636e\u5e93\u6784\u5efa\u5931\u8d25[]");
+                        popupInfo("UID\u6570\u636e\u5e93\u6784\u5efa\u5931\u8d25");
                         return;
                     }
                     const m = result.meta;
-                    toast("[accent]\u6784\u5efa\u5b8c\u6210: " + m.foundCount + "/" + m.targetCount + "[]");
+                    popupInfo("\u6784\u5efa\u5b8c\u6210\n\u77edUID\u8986\u76d6: " + m.foundCount + "/" + m.targetCount + "\n\u957fid\u603b\u6570: " + (m.longIdCount || 0));
                 });
-                toast("[accent]\u5df2\u542f\u52a8UID\u6570\u636e\u5e93\u7a77\u4e3e(8\u79d2)...[]");
+                popupInfo("\u5df2\u542f\u52a8UID\u6570\u636e\u5e93\u7a77\u4e3e(8\u79d2)...");
             });
+        }).height(54).growX().row();
+
+        table.button("\u4ece\u526a\u8d34\u677f\u5bfc\u5165UID\u6570\u636e\u5e93", Icon.copySmall, Styles.cleart, () => {
+            const text = "" + (Core.app.getClipboardText() || "");
+            const result = importUidDbText(text);
+            if(!result.ok){
+                popupInfo(result.message || "\u5bfc\u5165\u5931\u8d25");
+                return;
+            }
+            popupInfo(result.message + "\n\u65b0\u589e: " + result.added + "\n\u91cd\u590d: " + result.duplicate + "\n\u65e0\u6548: " + result.invalid + "\nUID\u4e0d\u5339\u914d: " + result.mismatch);
         }).height(54).growX().row();
 
         table.button("\u67e5\u8be2UID\u6570\u636e\u5e93", Icon.copySmall, Styles.cleart, () => showUidDbLookupDialog())

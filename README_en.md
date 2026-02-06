@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.0.2`
+Current version: `v1.1.0`
 
 ## Features
 
@@ -12,14 +12,16 @@ Current version: `v1.0.2`
 - Per-server auto-switch by exact `ip:port`.
 - Built-in UID database:
   - Run `Bruteforce all 3-char UIDs (8s)` from settings.
+  - Import databases from clipboard, deduplicated by `uid3 + long id`.
+  - Settings lookup lists all long IDs for the same 3-char UID with per-item copy buttons.
   - Query from settings or directly in Join Game after DB build.
 
 ## Install
 
 Import built artifacts into Mindustry mods folder:
 
-- Recommended: `构建/uuidmanager-1.0.2.zip`
-- Alternative: `构建/uuidmanager-1.0.2.jar`
+- Recommended: `构建/uuidmanager-1.1.0.zip`
+- Alternative: `构建/uuidmanager-1.1.0.jar`
 
 ## Build Locally
 
