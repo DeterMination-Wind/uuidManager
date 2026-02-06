@@ -43,6 +43,7 @@ const Trigger = Packages.mindustry.game.EventType.Trigger;
 
 const STATE_KEY = "uuidmanager.state";
 const UID_DB_KEY = "uuidmanager.uiddb";
+const UID_DB_FILE = "uuidmanager.uiddb.json";
 const APPROVED_KEY = "uuidmanager.approved";
 const JOIN_ROW_NAME = "uuidmanager-join-row";
 const APPROVAL_CODE_XOR = [
@@ -73,6 +74,14 @@ function toast(text){
     }catch(e){
         // Fallback for older builds.
         Log.info(text);
+    }
+}
+
+function popupInfo(text){
+    try{
+        Vars.ui.showInfo("" + text);
+    }catch(e){
+        Log.info("" + text);
     }
 }
 
@@ -198,6 +207,15 @@ function defaultUidDb(){
     };
 }
 
+function getUidDbFi(){
+    try{
+        if(Vars == null || Vars.dataDirectory == null) return null;
+        return Vars.dataDirectory.child(UID_DB_FILE);
+    }catch(e){
+        return null;
+    }
+}
+
 function uidDbMetaText(db){
     const m = (db && db.meta) ? db.meta : {};
     const found = Number(m.foundCount || 0);
@@ -218,8 +236,24 @@ function getUidDbMetaText(){
 function loadUidDb(){
     if(_uidDbCache != null) return _uidDbCache;
 
-    const raw = Core.settings.getString(UID_DB_KEY, "");
-    const db = safeParseJson(raw, defaultUidDb());
+    let db = null;
+    let migratedFromSettings = false;
+
+    try{
+        const fi = getUidDbFi();
+        if(fi != null && fi.exists()){
+            db = safeParseJson(fi.readString(), null);
+        }
+    }catch(e){
+        db = null;
+    }
+
+    if(typeof db !== "object" || db == null){
+        const raw = Core.settings.getString(UID_DB_KEY, "");
+        db = safeParseJson(raw, null);
+        migratedFromSettings = (typeof db === "object" && db != null);
+    }
+
     if(typeof db !== "object" || db == null){
         _uidDbCache = defaultUidDb();
         _uidDbMetaText = uidDbMetaText(_uidDbCache);
@@ -239,6 +273,21 @@ function loadUidDb(){
         clean[key] = val;
     }
     db.map = clean;
+
+    // One-time migration from Arc settings string storage to external JSON file.
+    if(migratedFromSettings){
+        try{
+            const fi = getUidDbFi();
+            if(fi != null){
+                fi.writeString(JSON.stringify(db), false);
+            }
+            Core.settings.remove(UID_DB_KEY);
+            saveSettingsCompat();
+        }catch(e){
+            // keep working from memory even if migration write fails
+        }
+    }
+
     _uidDbCache = db;
     _uidDbMetaText = uidDbMetaText(db);
     return db;
@@ -248,11 +297,16 @@ function saveUidDb(db){
     try{
         _uidDbCache = db;
         _uidDbMetaText = uidDbMetaText(db);
-        Core.settings.put(UID_DB_KEY, JSON.stringify(db));
-        saveSettingsCompat();
+        const fi = getUidDbFi();
+        if(fi == null){
+            return false;
+        }
+        fi.writeString(JSON.stringify(db), false);
+        return true;
     }catch(e){
         Log.err("[uuidmanager] Failed to save uid db.");
         Log.err(e);
+        return false;
     }
 }
 
@@ -580,11 +634,11 @@ function buildUidDbAll8s(onDone){
                         lastBuildSec: 8
                     };
 
-                    saveUidDb(db);
+                    const saved = saveUidDb(db);
                     _uidBuildRunning = false;
 
                     if(typeof onDone === "function"){
-                        onDone({ok: true, meta: db.meta});
+                        onDone({ok: saved, meta: db.meta});
                     }
                 }catch(e){
                     _uidBuildRunning = false;
@@ -603,17 +657,17 @@ function showUidDbLookupDialog(){
     showPrompt("UID\u6570\u636e\u5e93\u67e5\u8be2", "\u8f93\u51653\u4f4dUID", "", uid => {
         const key = sanitizeIdText(uid);
         if(key.length !== 3){
-            toast("\u8bf7\u8f93\u51653\u4f4dUID");
+            popupInfo("\u8bf7\u8f93\u51653\u4f4dUID");
             return;
         }
         const uuid8 = lookupUuid8ByUid(key);
         if(uuid8.length === 0){
-            toast("\u6570\u636e\u5e93\u672a\u547d\u4e2d: " + key);
+            popupInfo("\u6570\u636e\u5e93\u672a\u547d\u4e2d: " + key);
             return;
         }
 
         Core.app.setClipboardText(uuid8);
-        toast("\u60a8\u5df2\u590d\u5236");
+        popupInfo("\u60a8\u5df2\u590d\u5236");
     });
 }
 
