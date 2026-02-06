@@ -45,7 +45,12 @@ const STATE_KEY = "uuidmanager.state";
 const UID_DB_KEY = "uuidmanager.uiddb";
 const APPROVED_KEY = "uuidmanager.approved";
 const JOIN_ROW_NAME = "uuidmanager-join-row";
-const APPROVAL_CODE = "RGV0ZXJNaW5hdGlvbi1BbGxvd2VkLVRPLVVTRS1USEUtTU9E";
+const APPROVAL_CODE_XOR = [
+    9, 43, 43, 190, 197, 232, 139, 156, 130, 163, 48, 126,
+    67, 127, 37, 44, 9, 21, 188, 220, 205, 135, 169, 148,
+    151, 54, 67, 77, 123, 30, 11, 58, 55, 218, 203, 250,
+    237, 131, 208, 167, 80, 81, 112, 66, 19, 13, 80, 63
+];
 const UID_GEN_WARNING = "1.uuid\u76f8\u540c\u5e76\u4e0d\u80fd\u83b7\u5f97\u4ed6\u4eba\u7ba1\u7406\u6743\u9650\n2.\u6ee5\u7528\u8be5\u529f\u80fd\u4f1a\u5bfc\u81f4Wayzer\u6539\u53d8uuid\u8ba1\u7b97\u7b56\u7565\uff0c\u614e\u7528\n3.\u7528\u8be5\u5de5\u5177\u4f2a\u88c5\u4ed6\u4eba\u7684\u4e00\u5f8b\u7b97\u50bb\u903c";
 
 let _sha1Digest = null;
@@ -54,6 +59,7 @@ let _uidTargetCache = null;
 let _uidBuildRunning = false;
 let _uidDbCache = null;
 let _uidDbMetaText = "";
+let _approvalCodeCache = null;
 
 function tr(key){
     // Mindustry UI treats strings starting with '@' as bundle keys in many helpers,
@@ -68,6 +74,34 @@ function toast(text){
         // Fallback for older builds.
         Log.info(text);
     }
+}
+
+function saveSettingsCompat(){
+    try{
+        if(Core.settings == null) return;
+        if(typeof Core.settings.manualSave === "function"){
+            Core.settings.manualSave();
+        }else if(typeof Core.settings.forceSave === "function"){
+            Core.settings.forceSave();
+        }else if(typeof Core.settings.save === "function"){
+            Core.settings.save();
+        }else if(typeof Core.settings.autosave === "function"){
+            Core.settings.autosave();
+        }
+    }catch(e){
+        // ignore compatibility failures; settings are still put() into memory.
+    }
+}
+
+function getApprovalCode(){
+    if(_approvalCodeCache != null) return _approvalCodeCache;
+    let out = "";
+    for(let i = 0; i < APPROVAL_CODE_XOR.length; i++){
+        const mask = (i * 17 + 91) & 0xff;
+        out += String.fromCharCode((APPROVAL_CODE_XOR[i] ^ mask) & 0xff);
+    }
+    _approvalCodeCache = out;
+    return out;
 }
 
 function cons(fn){
@@ -124,7 +158,7 @@ function loadState(){
 function saveState(state){
     try{
         Core.settings.put(STATE_KEY, JSON.stringify(state));
-        Core.settings.save();
+        saveSettingsCompat();
     }catch(e){
         Log.err("[uuidmanager] Failed to save state.");
         Log.err(e);
@@ -142,7 +176,7 @@ function isApproved(){
 function setApproved(v){
     try{
         Core.settings.put(APPROVED_KEY, !!v);
-        Core.settings.save();
+        saveSettingsCompat();
     }catch(e){
         // ignore
     }
@@ -215,7 +249,7 @@ function saveUidDb(db){
         _uidDbCache = db;
         _uidDbMetaText = uidDbMetaText(db);
         Core.settings.put(UID_DB_KEY, JSON.stringify(db));
-        Core.settings.save();
+        saveSettingsCompat();
     }catch(e){
         Log.err("[uuidmanager] Failed to save uid db.");
         Log.err(e);
@@ -607,7 +641,7 @@ function showUidGenerateConfirmDialog(onApproved){
     dialog.buttons.button("\u786e\u8ba4\u751f\u6210", () => {
         dialog.hide();
         showApprovalCodePrompt(code => {
-            if(sanitizeIdText(code) !== APPROVAL_CODE){
+            if(sanitizeIdText(code) !== getApprovalCode()){
                 toast("[scarlet]\u5ba1\u6279\u7801\u9519\u8bef\uff0c\u5df2\u9000\u51fa[]");
                 return;
             }
@@ -746,7 +780,7 @@ function getCurrentUuid8(){
 
 function setCurrentUuid8(uuid8){
     Core.settings.put("uuid", "" + uuid8);
-    Core.settings.save();
+    saveSettingsCompat();
 }
 
 function getUid16ForUuid8(uuid8){

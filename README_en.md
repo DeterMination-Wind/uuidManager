@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.0.0`
+Current version: `v1.0.1`
 
 ## Features
 
