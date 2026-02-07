@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.1.0`
+Current version: `v1.1.1`
 
 ## Features
 
@@ -20,8 +20,8 @@ Current version: `v1.1.0`
 
 Import built artifacts into Mindustry mods folder:
 
-- Recommended: `构建/uuidmanager-1.1.0.zip`
-- Alternative: `构建/uuidmanager-1.1.0.jar`
+- Recommended: `构建/uuidmanager-1.1.1.zip`
+- Alternative: `构建/uuidmanager-1.1.1.jar`
 
 ## Build Locally
 

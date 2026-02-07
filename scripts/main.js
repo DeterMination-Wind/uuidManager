@@ -11,6 +11,7 @@ const Events = Packages.arc.Events;
 const Log = Packages.arc.util.Log;
 const Strings = Packages.arc.util.Strings;
 const Align = Packages.arc.util.Align;
+const Fi = Packages.arc.files.Fi;
 
 const Base64Coder = Packages.arc.util.serialization.Base64Coder;
 const CRC32 = Packages.java.util.zip.CRC32;
@@ -224,8 +225,33 @@ function uidDbMetaText(db){
     const timeout = Number(m.excludedTimeoutCount || 0);
     const cores = Number(m.cores || 0);
     const checked = Number(m.checked || 0);
-    return "\u77edUID\u8986\u76d6: " + found + "/" + total + "  |  \u957fid\u603b\u6570: " + longIds + "  |  \u8d85\u65f6\u6392\u9664: " + timeout + "\n" +
-        "\u4e0a\u6b21\u6784\u5efa\u6838\u5fc3\u6570: " + cores + "  |  \u5c1d\u8bd5\u6b21\u6570: " + checked;
+    return "\u6570\u636e\u5e93\u7edf\u8ba1:\n" +
+        "  \u2022 \u77edUID\u8986\u76d6: " + found + "/" + total + "\n" +
+        "  \u2022 \u957fid\u603b\u6761\u6570: " + longIds + "\n" +
+        "  \u2022 \u8d85\u65f6\u6392\u9664: " + timeout + "\n" +
+        "  \u2022 \u4e0a\u6b21\u6784\u5efa\u6838\u5fc3\u6570: " + cores + "\n" +
+        "  \u2022 \u7d2f\u8ba1\u5c1d\u8bd5\u6b21\u6570: " + checked;
+}
+
+function formatUidDbPrettyJson(db){
+    const out = {meta: db.meta || {}, map: {}};
+    const keys = Object.keys(db.map || {}).sort();
+    for(let i = 0; i < keys.length; i++){
+        const k = keys[i];
+        const list = uidListFromRaw(db.map[k]);
+        if(list.length === 0) continue;
+        const sorted = list.slice().sort();
+        out.map[k] = sorted;
+    }
+    return JSON.stringify(out, null, 2);
+}
+
+function summarizeImportResult(result){
+    return (result.message || "\u5bfc\u5165\u5b8c\u6210") + "\n" +
+        "\u65b0\u589e: " + Number(result.added || 0) + "\n" +
+        "\u91cd\u590d: " + Number(result.duplicate || 0) + "\n" +
+        "\u65e0\u6548: " + Number(result.invalid || 0) + "\n" +
+        "UID\u4e0d\u5339\u914d: " + Number(result.mismatch || 0);
 }
 
 function normalizeUidKey(uid3){
@@ -411,6 +437,31 @@ function saveUidDb(db){
         Log.err("[uuidmanager] Failed to save uid db.");
         Log.err(e);
         return false;
+    }
+}
+
+function exportUidDbToFile(pathText){
+    const db = loadUidDb();
+    recomputeUidDbMeta(db);
+
+    const path = ("" + (pathText == null ? "" : pathText)).trim();
+    const fi = path.length > 0 ? new Fi(path) : Vars.dataDirectory.child("uuidmanager.uiddb.export.json");
+    fi.writeString(formatUidDbPrettyJson(db), false);
+    return fi.absolutePath();
+}
+
+function importUidDbFromFile(pathText){
+    const path = ("" + (pathText == null ? "" : pathText)).trim();
+    if(path.length === 0) return {ok: false, message: "\u8bf7\u8f93\u5165\u6587\u4ef6\u8def\u5f84"};
+
+    const fi = new Fi(path);
+    if(!fi.exists()) return {ok: false, message: "\u6587\u4ef6\u4e0d\u5b58\u5728"};
+
+    try{
+        const text = fi.readString();
+        return importUidDbText(text);
+    }catch(e){
+        return {ok: false, message: "\u8bfb\u53d6\u6587\u4ef6\u5931\u8d25"};
     }
 }
 
@@ -652,10 +703,24 @@ function findUuid8ByUidShortParallel(targetUid, onDone){
     }
 }
 
-function buildUidDbAll8s(onDone){
+function buildUidDbAll8s(onDone, onProgress){
     if(_uidBuildRunning){
         toast("[accent]UID\u6570\u636e\u5e93\u6784\u5efa\u4e2d...[]");
         return;
+    }
+
+    const dbBase = loadUidDb();
+    const targetInfo = getAllUidTargets();
+    const totalTargets = targetInfo.targets.length;
+    const existingCovered = new ConcurrentHashMap();
+    let existingCount = 0;
+    for(let i = 0; i < targetInfo.targets.length; i++){
+        const k = targetInfo.targets[i];
+        const list = uidListFromRaw(dbBase.map[k]);
+        if(list.length > 0){
+            existingCovered.put(k, true);
+            existingCount++;
+        }
     }
 
     _uidBuildRunning = true;
@@ -664,13 +729,22 @@ function buildUidDbAll8s(onDone){
     const deadline = Number(System.currentTimeMillis()) + runMillis;
     const checked = new AtomicLong(0);
     const finished = new AtomicInteger(0);
+    const step = 500000;
     const maxFoundPairs = 200000;
     const foundPairs = new ConcurrentHashMap();
+    const newCovered = new ConcurrentHashMap();
+
+    if(typeof onProgress === "function"){
+        try{
+            onProgress({checked: 0, covered: existingCount, total: totalTargets});
+        }catch(e){ }
+    }
 
     for(let wid = 0; wid < cores; wid++){
         const workerId = wid;
         const worker = new Runnable({
             run: function(){
+                let localChecked = 0;
                 try{
                     const seed = Number(System.nanoTime()) + workerId * 1103515245;
                     const rng = new Random(seed);
@@ -689,12 +763,20 @@ function buildUidDbAll8s(onDone){
                                 const pairKey = sid + "|" + b64Encode(uuidBytes);
                                 foundPairs.putIfAbsent(pairKey, true);
                             }
+                            if(!existingCovered.containsKey(sid)){
+                                newCovered.putIfAbsent(sid, true);
+                            }
                         }
-                        checked.incrementAndGet();
+                        localChecked++;
+                        if(localChecked >= step){
+                            checked.addAndGet(localChecked);
+                            localChecked = 0;
+                        }
                     }
                 }catch(e){
                     // ignore single worker failure
                 }finally{
+                    if(localChecked > 0) checked.addAndGet(localChecked);
                     finished.incrementAndGet();
                 }
             }
@@ -707,8 +789,28 @@ function buildUidDbAll8s(onDone){
 
     const waiter = new Runnable({
         run: function(){
+            let lastStep = -1;
+            let lastCovered = -1;
             while(finished.get() < cores){
+                const c = Number(checked.get());
+                const coveredNow = Math.min(totalTargets, existingCount + newCovered.size());
+                const stepNow = Math.floor(c / step);
+                if(typeof onProgress === "function" && (stepNow !== lastStep || coveredNow !== lastCovered)){
+                    lastStep = stepNow;
+                    lastCovered = coveredNow;
+                    Core.app.post(() => {
+                        try{ onProgress({checked: c, covered: coveredNow, total: totalTargets}); }catch(e){ }
+                    });
+                }
                 try{ Packages.java.lang.Thread.sleep(50); }catch(e){ }
+            }
+
+            if(typeof onProgress === "function"){
+                const c = Number(checked.get());
+                const coveredNow = Math.min(totalTargets, existingCount + newCovered.size());
+                Core.app.post(() => {
+                    try{ onProgress({checked: c, covered: coveredNow, total: totalTargets}); }catch(e){ }
+                });
             }
 
             Core.app.post(() => {
@@ -965,6 +1067,106 @@ function showUidDbLookupDialog(){
                 popupInfo("\u67e5\u8be2\u7a97\u53e3\u6253\u5f00\u5931\u8d25");
             }
         });
+    });
+}
+
+function makeAsciiProgressBar(current, total, width){
+    const w = Math.max(10, Number(width || 28));
+    if(total <= 0) return "[" + new Array(w + 1).join("-") + "]";
+    const ratio = Math.max(0, Math.min(1, current / total));
+    const fill = Math.floor(ratio * w);
+    let s = "[";
+    for(let i = 0; i < w; i++) s += (i < fill ? "#" : "-");
+    s += "]";
+    return s;
+}
+
+function showUidBruteforceProgressDialog(){
+    const dialog = new BaseDialog("UID\u7a77\u4e3e\u8fdb\u5ea6");
+    dialog.closeOnBack();
+
+    let covered = 0;
+    let total = getAllUidTargets().targets.length;
+    let checked = 0;
+
+    dialog.cont.table(cons(t => {
+        t.left();
+        t.defaults().left().pad(6);
+        t.label(() => {
+            return "\u8fdb\u5ea6: " + covered + "/" + total + "\n" +
+                makeAsciiProgressBar(covered, total, 32) + "\n" +
+                "\u7a77\u4e3e\u6b21\u6570: " + checked + " (\u6bcf50\u4e07\u6b21\u66f4\u65b0\u4e00\u6b65)";
+        }).color(Pal.lightishGray).left().wrap().width(720);
+    })).growX().row();
+
+    dialog.buttons.defaults().size(220, 54).pad(4);
+    dialog.buttons.button("\u540e\u53f0\u8fd0\u884c", () => dialog.hide());
+
+    dialog.show();
+
+    buildUidDbAll8s(result => {
+        try{ dialog.hide(); }catch(e){ }
+
+        if(!result || !result.ok){
+            popupInfo("UID\u6570\u636e\u5e93\u6784\u5efa\u5931\u8d25");
+            return;
+        }
+        const m = result.meta;
+        popupInfo("\u6784\u5efa\u5b8c\u6210\n\u77edUID\u8986\u76d6: " + m.foundCount + "/" + m.targetCount + "\n\u957fid\u603b\u6570: " + (m.longIdCount || 0));
+    }, prog => {
+        covered = Number(prog.covered || 0);
+        total = Number(prog.total || total);
+        checked = Number(prog.checked || checked);
+    });
+}
+
+function showUidImportDialog(){
+    const dialog = new BaseDialog("\u5bfc\u5165UID\u6570\u636e\u5e93");
+    dialog.closeOnBack();
+
+    dialog.cont.table(cons(t => {
+        t.left();
+        t.defaults().left().pad(6);
+        t.add("\u652f\u6301\u4ece\u526a\u8d34\u677f\u6216\u6587\u4ef6\u5bfc\u5165\u6570\u636e\u5e93").color(Pal.accent);
+    })).growX().row();
+
+    dialog.buttons.defaults().height(54).pad(4);
+    dialog.buttons.button("\u4ece\u526a\u8d34\u677f\u5bfc\u5165", () => {
+        dialog.hide();
+        const text = "" + (Core.app.getClipboardText() || "");
+        const result = importUidDbText(text);
+        if(!result.ok){
+            popupInfo(result.message || "\u5bfc\u5165\u5931\u8d25");
+            return;
+        }
+        popupInfo(summarizeImportResult(result));
+    }).width(220);
+
+    dialog.buttons.button("\u4ece\u6587\u4ef6\u5bfc\u5165", () => {
+        dialog.hide();
+        showPrompt("\u5bfc\u5165\u6587\u4ef6\u8def\u5f84", "\u8f93\u5165JSON/TXT\u6570\u636e\u5e93\u6587\u4ef6\u8def\u5f84", "", path => {
+            const result = importUidDbFromFile(path);
+            if(!result.ok){
+                popupInfo(result.message || "\u5bfc\u5165\u5931\u8d25");
+                return;
+            }
+            popupInfo(summarizeImportResult(result));
+        });
+    }).width(220);
+
+    dialog.buttons.button("\u53d6\u6d88", () => dialog.hide()).width(150);
+    dialog.show();
+}
+
+function showUidExportDialog(){
+    showPrompt("\u5bfc\u51faUID\u6570\u636e\u5e93", "\u8f93\u5165\u5bfc\u51fa\u8def\u5f84(\u53ef\u7559\u7a7a\u4f7f\u7528\u9ed8\u8ba4)", "", path => {
+        try{
+            const outPath = exportUidDbToFile(path);
+            Core.app.setClipboardText(outPath);
+            popupInfo("\u5bfc\u51fa\u6210\u529f\n" + outPath + "\n\u8def\u5f84\u5df2\u590d\u5236");
+        }catch(e){
+            popupInfo("\u5bfc\u51fa\u5931\u8d25");
+        }
     });
 }
 
@@ -1712,26 +1914,16 @@ function addSettingsCategory(){
 
         table.button("\u7a77\u4e3e\u6240\u67093\u4f4dUID(8\u79d2)", Icon.bookSmall, Styles.cleart, () => {
             ensureApprovedWithWarning(() => {
-                buildUidDbAll8s(result => {
-                    if(!result || !result.ok){
-                        popupInfo("UID\u6570\u636e\u5e93\u6784\u5efa\u5931\u8d25");
-                        return;
-                    }
-                    const m = result.meta;
-                    popupInfo("\u6784\u5efa\u5b8c\u6210\n\u77edUID\u8986\u76d6: " + m.foundCount + "/" + m.targetCount + "\n\u957fid\u603b\u6570: " + (m.longIdCount || 0));
-                });
-                popupInfo("\u5df2\u542f\u52a8UID\u6570\u636e\u5e93\u7a77\u4e3e(8\u79d2)...");
+                showUidBruteforceProgressDialog();
             });
         }).height(54).growX().row();
 
-        table.button("\u4ece\u526a\u8d34\u677f\u5bfc\u5165UID\u6570\u636e\u5e93", Icon.copySmall, Styles.cleart, () => {
-            const text = "" + (Core.app.getClipboardText() || "");
-            const result = importUidDbText(text);
-            if(!result.ok){
-                popupInfo(result.message || "\u5bfc\u5165\u5931\u8d25");
-                return;
-            }
-            popupInfo(result.message + "\n\u65b0\u589e: " + result.added + "\n\u91cd\u590d: " + result.duplicate + "\n\u65e0\u6548: " + result.invalid + "\nUID\u4e0d\u5339\u914d: " + result.mismatch);
+        table.button("\u5bfc\u5165UID\u6570\u636e\u5e93", Icon.copySmall, Styles.cleart, () => {
+            showUidImportDialog();
+        }).height(54).growX().row();
+
+        table.button("\u5bfc\u51faUID\u6570\u636e\u5e93", Icon.bookSmall, Styles.cleart, () => {
+            showUidExportDialog();
         }).height(54).growX().row();
 
         table.button("\u67e5\u8be2UID\u6570\u636e\u5e93", Icon.copySmall, Styles.cleart, () => showUidDbLookupDialog())
