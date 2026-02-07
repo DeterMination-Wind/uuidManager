@@ -11,7 +11,7 @@ const Events = Packages.arc.Events;
 const Log = Packages.arc.util.Log;
 const Strings = Packages.arc.util.Strings;
 const Align = Packages.arc.util.Align;
-const Bar = Packages.arc.scene.ui.Bar;
+const Bar = Packages.mindustry.ui.Bar;
 const Fi = Packages.arc.files.Fi;
 const Http = Packages.arc.util.Http;
 const Jval = Packages.arc.util.serialization.Jval;
@@ -892,6 +892,33 @@ function clearUidDbShardFiles(baseFi){
     }
 }
 
+function listUidDbShardFiles(baseFi){
+    try{
+        const parent = baseFi.parent();
+        if(parent == null) return [];
+        const files = parent.list();
+        if(files == null) return [];
+
+        const names = [];
+        for(let i = 0; i < files.length; i++){
+            const f = files[i];
+            if(f == null) continue;
+            const name = "" + f.name();
+            if(!isUidDbShardFileName(name)) continue;
+            names.push(name);
+        }
+        names.sort();
+
+        const out = [];
+        for(let i = 0; i < names.length; i++){
+            out.push(parent.child(names[i]));
+        }
+        return out;
+    }catch(e){
+        return [];
+    }
+}
+
 function collectUidDbEntriesForSave(db){
     const out = [];
     const maxEntryBytes = Math.max(1024, UID_DB_SHARD_BYTES - 1024);
@@ -1073,8 +1100,28 @@ function getUidDbMetaText(){
                     "  \u2022 \u5df2\u68c0\u6d4b\u5230\u672c\u5730\u6570\u636e\u5e93\u6587\u4ef6\n" +
                     "  \u2022 \u5206\u7247\u6570\u91cf: " + Math.max(1, shardCount) + "\n" +
                     "  \u2022 \u603b\u5927\u5c0f: " + Strings.autoFixed(mb, 2) + "MB\n" +
+                    "  \u2022 \u8def\u5f84: " + fi.absolutePath() + "\n" +
                     "  \u2022 \u9996\u6b21\u67e5\u8be2/\u7a77\u4e3e\u65f6\u518d\u52a0\u8f7d";
                 return _uidDbMetaText;
+            }
+
+            // Manifest missing but shards exist (e.g. user deleted the manifest).
+            if(fi != null){
+                const shards = listUidDbShardFiles(fi);
+                if(shards.length > 0){
+                    let totalBytes = 0;
+                    for(let i = 0; i < shards.length; i++){
+                        try{ totalBytes += Number(shards[i].length()); }catch(e){ }
+                    }
+                    const mb = totalBytes / 1024 / 1024;
+                    _uidDbMetaText = "\u6570\u636e\u5e93\u7edf\u8ba1:\n" +
+                        "  \u2022 \u5df2\u68c0\u6d4b\u5230\u5206\u7247\u6587\u4ef6(\u7f3a\u5c11\u6e05\u5355\u6587\u4ef6)\n" +
+                        "  \u2022 \u5206\u7247\u6570\u91cf: " + shards.length + "\n" +
+                        "  \u2022 \u603b\u5927\u5c0f: " + Strings.autoFixed(mb, 2) + "MB\n" +
+                        "  \u2022 \u8def\u5f84: " + fi.absolutePath() + "\n" +
+                        "  \u2022 \u9996\u6b21\u67e5\u8be2/\u7a77\u4e3e\u65f6\u518d\u52a0\u8f7d";
+                    return _uidDbMetaText;
+                }
             }
         }catch(e){
             // ignore pre-load hint failures
@@ -1110,6 +1157,27 @@ function loadUidDb(){
                 }else{
                     db = parsed;
                 }
+            }
+        }else{
+            // Manifest missing but shards exist.
+            const shards = listUidDbShardFiles(fi);
+            if(shards.length > 0){
+                loadedFromFile = true;
+                const tmp = defaultUidDb();
+                for(let i = 0; i < shards.length; i++){
+                    try{
+                        const parsed = parseUidDbText(shards[i].readString());
+                        if(parsed == null || typeof parsed !== "object") continue;
+                        if(typeof parsed.map === "object" && parsed.map != null && !Array.isArray(parsed.map)){
+                            mergeUidMapIntoDb(tmp, parsed.map);
+                        }else{
+                            mergeUidMapIntoDb(tmp, parsed);
+                        }
+                    }catch(e){
+                        // ignore bad shard
+                    }
+                }
+                db = tmp;
             }
         }
     }catch(e){
