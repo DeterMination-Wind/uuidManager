@@ -481,6 +481,107 @@ function safeParseJson(text, fallback){
     }
 }
 
+function jvalToJsMetaValue(v){
+    if(v == null || v.isNull()) return null;
+    try{
+        if(v.isBoolean()) return !!v.asBool();
+        if(v.isNumber()) return Number(v.asDouble());
+        return "" + v.asString();
+    }catch(e){
+        return null;
+    }
+}
+
+function jvalToUidList(v){
+    const out = [];
+    if(v == null || v.isNull()) return out;
+
+    if(v.isArray()){
+        const arr = v.asArray();
+        for(let i = 0; i < arr.size; i++){
+            const iv = arr.get(i);
+            if(iv == null || iv.isNull()) continue;
+            try{
+                out.push(sanitizeIdText(iv.asString()));
+            }catch(e){
+                // ignore malformed item
+            }
+        }
+        return out;
+    }
+
+    try{
+        out.push(sanitizeIdText(v.asString()));
+    }catch(e){
+        // ignore malformed scalar
+    }
+    return out;
+}
+
+function parseUidDbByJval(text){
+    try{
+        const root = Jval.read("" + text);
+        if(root == null || !root.isObject()) return null;
+
+        const out = defaultUidDb();
+
+        const mapVal = root.get("map");
+        if(mapVal != null && mapVal.isObject()){
+            const mapObj = mapVal.asObject();
+            const it = mapObj.iterator();
+            while(it.hasNext()){
+                const e = it.next();
+                const key = "" + e.key;
+                const list = jvalToUidList(e.value);
+                if(list.length === 0) continue;
+                out.map[key] = list;
+            }
+        }
+
+        const metaVal = root.get("meta");
+        if(metaVal != null && metaVal.isObject()){
+            const metaObj = metaVal.asObject();
+            const it = metaObj.iterator();
+            while(it.hasNext()){
+                const e = it.next();
+                const key = "" + e.key;
+                const value = jvalToJsMetaValue(e.value);
+                if(value == null) continue;
+                out.meta[key] = value;
+            }
+        }
+
+        return out;
+    }catch(e){
+        return null;
+    }
+}
+
+function parseUidDbText(text){
+    // Prefer Arc parser for very large DB files; Rhino JSON.parse may fail on huge objects.
+    const viaJval = parseUidDbByJval(text);
+    if(viaJval != null) return viaJval;
+    return safeParseJson(text, null);
+}
+
+function maybeInvalidateUidDbCache(){
+    // If cache is empty but the on-disk DB exists, allow a lazy reload.
+    try{
+        if(_uidDbCache == null || _uidDbCache.map == null) return;
+        for(var k in _uidDbCache.map){
+            if(Object.prototype.hasOwnProperty.call(_uidDbCache.map, k)) return;
+        }
+
+        const fi = getUidDbFi();
+        if(fi != null && fi.exists() && Number(fi.length()) > 2){
+            _uidDbCache = null;
+            _uidDbMetaText = "";
+        }
+    }catch(e){
+        // ignore retry helper failures
+    }
+}
+
 function defaultState(){
     return {
         autoSwitch: true,
@@ -652,6 +753,7 @@ function addUidPair(db, uid3, uuid8){
 }
 
 function getUidListByUid(uid3){
+    maybeInvalidateUidDbCache();
     const key = normalizeUidKey(uid3);
     if(key.length !== 3) return [];
 
@@ -697,6 +799,7 @@ function recomputeUidDbMeta(db, patch){
 }
 
 function getUidDbMetaText(){
+    maybeInvalidateUidDbCache();
     if(_uidDbMetaText.length > 0) return _uidDbMetaText;
     const db = loadUidDb();
     return uidDbMetaText(db);
@@ -705,13 +808,20 @@ function getUidDbMetaText(){
 function loadUidDb(){
     if(_uidDbCache != null) return _uidDbCache;
 
+    const fi = getUidDbFi();
+    if(fi == null){
+        // Data directory may be unavailable during very early startup; do not cache empty DB yet.
+        const tmp = defaultUidDb();
+        _uidDbMetaText = uidDbMetaText(tmp);
+        return tmp;
+    }
+
     let db = null;
     let migratedFromSettings = false;
 
     try{
-        const fi = getUidDbFi();
-        if(fi != null && fi.exists()){
-            db = safeParseJson(fi.readString(), null);
+        if(fi.exists()){
+            db = parseUidDbText(fi.readString());
         }
     }catch(e){
         db = null;
@@ -757,10 +867,7 @@ function loadUidDb(){
     // One-time migration from Arc settings string storage to external JSON file.
     if(migratedFromSettings){
         try{
-            const fi = getUidDbFi();
-            if(fi != null){
-                fi.writeString(JSON.stringify(db), false);
-            }
+            fi.writeString(JSON.stringify(db), false);
             Core.settings.remove(UID_DB_KEY);
             saveSettingsCompat();
         }catch(e){
