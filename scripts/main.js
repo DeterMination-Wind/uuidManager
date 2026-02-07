@@ -41,6 +41,7 @@ const BaseDialog = Packages.mindustry.ui.dialogs.BaseDialog;
 const Icon = Packages.mindustry.gen.Icon;
 
 const ClientLoadEvent = Packages.mindustry.game.EventType.ClientLoadEvent;
+const ClientPreConnectEvent = Packages.mindustry.game.EventType.ClientPreConnectEvent;
 const ClientServerConnectEvent = Packages.mindustry.game.EventType.ClientServerConnectEvent;
 const Trigger = Packages.mindustry.game.EventType.Trigger;
 
@@ -96,6 +97,13 @@ function popupInfo(text){
     }catch(e){
         Log.info("" + text);
     }
+}
+
+function copyToClipboard(text, tag){
+    const value = "" + (text == null ? "" : text);
+    if(value.length === 0) return;
+    Core.app.setClipboardText(value);
+    toast(tag && ("" + tag).length > 0 ? ("Copied " + tag) : "Copied");
 }
 
 function saveSettingsCompat(){
@@ -1890,10 +1898,6 @@ function getUidSha1ForUuid8(uuid8){
     return sha1Hex(s);
 }
 
-function serverKey(ip, port){
-    return ("" + ip).trim().toLowerCase() + ":" + port;
-}
-
 function normalizeServerKeyInput(text){
     // Canonicalize to the same format used by ClientServerConnectEvent: ip:port.
     // Default port is 6567 if omitted.
@@ -1916,12 +1920,35 @@ function normalizeServerKeyInput(text){
 }
 
 function findRuleForServer(state, ip, port){
-    const key = serverKey(ip, port);
+    const candidates = [];
+    const push = key => {
+        if(key == null || key.length === 0) return;
+        for(let i = 0; i < candidates.length; i++){
+            if(candidates[i] === key) return;
+        }
+        candidates.push(key);
+    };
+
+    const sip = ("" + (ip == null ? "" : ip)).trim().toLowerCase();
+    const p = Number(port || 0);
+    const finalPort = p > 0 ? p : 6567;
+
+    push(normalizeServerKeyInput(sip + ":" + finalPort));
+    push(normalizeServerKeyInput(sip));
+
+    // Some paths may include IPv6 brackets while others may not.
+    if(sip.length > 2 && sip.charAt(0) === "[" && sip.charAt(sip.length - 1) === "]"){
+        const plain = sip.substring(1, sip.length - 1);
+        push(normalizeServerKeyInput(plain + ":" + finalPort));
+        push(normalizeServerKeyInput(plain));
+    }
+
     for(let i = 0; i < state.serverRules.length; i++){
         const r = state.serverRules[i];
         if(!r || typeof r !== "object") continue;
-        if(("" + (r.server || "")).trim().toLowerCase() === key){
-            return r;
+        const ruleKey = normalizeServerKeyInput(r.server || "");
+        for(let j = 0; j < candidates.length; j++){
+            if(ruleKey === candidates[j]) return r;
         }
     }
     return null;
@@ -1975,8 +2002,7 @@ function rebuildSavedList(container, state, options){
             row.defaults().pad(4).left();
 
             const actionText = options && options.pickOnly ? "@uuidmanager.saved.pick" : "@uuidmanager.saved.use";
-
-            row.button(actionText, Styles.cleart, () => {
+            const applyEntry = () => {
                 if(options && typeof options.onPick === "function"){
                     options.onPick(uuid8, entry);
                 }
@@ -1984,16 +2010,31 @@ function rebuildSavedList(container, state, options){
                     setCurrentUuid8(uuid8);
                 }
                 if(options && options.close) options.close();
-            }).width(96).height(44);
+            };
 
-             row.table(cons(info => {
-                  info.left();
-                  info.defaults().left();
-                  info.add((note.length > 0 ? note : "(no note)")).color(Pal.accent).row();
-                 info.add(tr("uuidmanager.saved.uuid") + ": " + uuid8).color(Pal.lightishGray).row();
-                 info.add(tr("uuidmanager.saved.uid") + ": " + uid).color(Pal.lightishGray).row();
-                 info.add(tr("uuidmanager.saved.sha1") + ": " + sha1).color(Pal.lightishGray);
-              })).growX();
+            row.button(actionText, Styles.cleart, applyEntry).width(96).height(44);
+
+            row.table(cons(info => {
+                info.center();
+                info.defaults().center().pad(2);
+                info.add((note.length > 0 ? note : "(no note)")).color(Pal.accent).center().growX().row();
+
+                info.button(tr("uuidmanager.saved.uuid") + ": " + uuid8, Styles.cleart, () => {
+                    if(options && options.pickOnly){
+                        applyEntry();
+                        return;
+                    }
+                    copyToClipboard(uuid8, "UUID");
+                }).height(38).growX().row();
+
+                info.button(tr("uuidmanager.saved.uid") + ": " + uid, Styles.cleart, () => {
+                    copyToClipboard(uid, "UID");
+                }).height(34).growX().row();
+
+                info.button(tr("uuidmanager.saved.sha1") + ": " + sha1, Styles.cleart, () => {
+                    copyToClipboard(sha1, "UID(SHA1)");
+                }).height(34).growX();
+            })).growX();
 
             row.button(Icon.pencilSmall, Styles.cleari, () => {
                 showPrompt("@uuidmanager.saved.edit", "@uuidmanager.saved.note", note, newNote => {
@@ -2033,14 +2074,14 @@ function showSavedUuidsDialog(options){
     };
 
     dialog.cont.table(cons(top => {
-        top.left();
-        top.defaults().pad(6).left();
+        top.center();
+        top.defaults().pad(4).center().growX();
         const uuid8 = getCurrentUuid8();
         const uid = getUidShortForUuid8(uuid8);
         const sha1 = getUidSha1ForUuid8(uuid8);
-        top.add(tr("uuidmanager.saved.uuid") + ": " + uuid8).color(Pal.lightishGray).row();
-        top.add(tr("uuidmanager.saved.uid") + ": " + uid).color(Pal.lightishGray).row();
-        top.add(tr("uuidmanager.saved.sha1") + ": " + sha1).color(Pal.lightishGray);
+        top.button(tr("uuidmanager.saved.uuid") + ": " + uuid8, Styles.cleart, () => copyToClipboard(uuid8, "UUID")).height(38).row();
+        top.button(tr("uuidmanager.saved.uid") + ": " + uid, Styles.cleart, () => copyToClipboard(uid, "UID")).height(34).row();
+        top.button(tr("uuidmanager.saved.sha1") + ": " + sha1, Styles.cleart, () => copyToClipboard(sha1, "UID(SHA1)")).height(34);
     })).growX().padBottom(10).row();
 
     dialog.cont.pane(cons(p => {
@@ -2473,21 +2514,36 @@ function addSettingsCategory(){
     });
 }
 
-// Auto-switch UUID before connecting.
-Events.on(ClientServerConnectEvent, e => {
+function tryApplyServerRuleFor(ip, port){
     const state = loadState();
-    if(!state.autoSwitch) return;
-    const rule = findRuleForServer(state, e.ip, e.port);
-    if(rule == null) return;
+    if(!state.autoSwitch) return false;
+
+    const rule = findRuleForServer(state, ip, port);
+    if(rule == null) return false;
 
     const norm = normalizeUuidOrUid(rule.uuid8 || "");
     if(!norm.valid){
         toast(tr("uuidmanager.toast.invalidRule").replace("{0}", "" + rule.server));
-        return;
+        return false;
     }
 
+    if(getCurrentUuid8() === norm.uuid8) return true;
+
     setCurrentUuid8(norm.uuid8);
-    toast(tr("uuidmanager.toast.switched").replace("{0}", serverKey(e.ip, e.port)));
+    toast(tr("uuidmanager.toast.switched").replace("{0}", normalizeServerKeyInput(("" + ip) + ":" + Number(port || 6567))));
+    return true;
+}
+
+// Primary hook: fired before connect in JoinDialog server entries.
+Events.on(ClientPreConnectEvent, e => {
+    if(e == null || e.host == null) return;
+    tryApplyServerRuleFor(e.host.address, e.host.port);
+});
+
+// Fallback hook for paths that do not emit pre-connect events.
+Events.on(ClientServerConnectEvent, e => {
+    if(e == null) return;
+    tryApplyServerRuleFor(e.ip, e.port);
 });
 
 Events.on(ClientLoadEvent, () => {
