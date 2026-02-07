@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.3.1`
+Current version: `v1.3.2`
 
 ## Features
 
@@ -19,6 +19,12 @@ Current version: `v1.3.1`
 
 ## Changelog
 
+### v1.3.2
+
+- Switch local UID DB storage to 64MB shards with shard-by-shard loading.
+- Make `uuidmanager.uiddb.json` human-readable with indentation and line breaks.
+- Support importing databases larger than 64MB via shard manifest + shard files, always merged incrementally.
+
 ### v1.3.1
 
 - Fix an issue where update prompt could fail to appear even when GitHub version is newer.
@@ -28,8 +34,8 @@ Current version: `v1.3.1`
 
 Import built artifacts into Mindustry mods folder:
 
-- Recommended: `构建/uuidmanager-1.3.1.zip`
-- Alternative: `构建/uuidmanager-1.3.1.jar`
+- Recommended: `构建/uuidmanager-1.3.2.zip`
+- Alternative: `构建/uuidmanager-1.3.2.jar`
 
 ## Build Locally
 

@@ -48,6 +48,9 @@ const Trigger = Packages.mindustry.game.EventType.Trigger;
 const STATE_KEY = "uuidmanager.state";
 const UID_DB_KEY = "uuidmanager.uiddb";
 const UID_DB_FILE = "uuidmanager.uiddb.json";
+const UID_DB_SHARD_PREFIX = "uuidmanager.uiddb.part-";
+const UID_DB_SHARD_SUFFIX = ".json";
+const UID_DB_SHARD_BYTES = 64 * 1024 * 1024;
 const APPROVED_KEY = "uuidmanager.approved";
 const JOIN_ROW_NAME = "uuidmanager-join-row";
 const UPDATE_OWNER = "DeterMination-Wind";
@@ -56,7 +59,6 @@ const UPDATE_MOD_NAME = "uuidmanager";
 const UPDATE_IGNORE_KEY = "uuidmanager.update.ignore";
 const UPDATE_LAST_AT_KEY = "uuidmanager.update.lastAt";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const IMPORT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SANITIZE_TEXT_LENGTH = 4096;
 const APPROVAL_CODE_XOR = [
     9, 43, 43, 190, 197, 232, 139, 156, 130, 163, 48, 126,
@@ -739,13 +741,12 @@ function uidDbMetaText(db){
 
 function formatUidDbPrettyJson(db){
     const out = {meta: db.meta || {}, map: {}};
-    const keys = Object.keys(db.map || {}).sort();
-    for(let i = 0; i < keys.length; i++){
-        const k = keys[i];
-        const list = uidListFromRaw(db.map[k]);
-        if(list.length === 0) continue;
-        const sorted = list.slice().sort();
-        out.map[k] = sorted;
+    const entries = collectUidDbEntriesForSave(db);
+    for(let i = 0; i < entries.length; i++){
+        const uid = entries[i].uid;
+        if(!(uid in out.map)) out.map[uid] = [];
+        const list = entries[i].list;
+        for(let j = 0; j < list.length; j++) out.map[uid].push(list[j]);
     }
     return JSON.stringify(out, null, 2);
 }
@@ -851,6 +852,198 @@ function recomputeUidDbMeta(db, patch){
     }
 }
 
+function utf8ByteLength(text){
+    try{
+        return Number((new Packages.java.lang.String("" + (text == null ? "" : text))).getBytes(Strings.utf8).length);
+    }catch(e){
+        return ("" + (text == null ? "" : text)).length;
+    }
+}
+
+function uidDbShardFileName(index){
+    let n = "" + (Number(index || 0) + 1);
+    while(n.length < 4) n = "0" + n;
+    return UID_DB_SHARD_PREFIX + n + UID_DB_SHARD_SUFFIX;
+}
+
+function isUidDbShardFileName(name){
+    const s = "" + (name == null ? "" : name);
+    return s.startsWith(UID_DB_SHARD_PREFIX) && s.endsWith(UID_DB_SHARD_SUFFIX);
+}
+
+function clearUidDbShardFiles(baseFi){
+    try{
+        const parent = baseFi.parent();
+        if(parent == null) return;
+        const files = parent.list();
+        if(files == null) return;
+        for(let i = 0; i < files.length; i++){
+            const f = files[i];
+            if(f == null) continue;
+            if(!isUidDbShardFileName("" + f.name())) continue;
+            try{ f.delete(); }catch(e){ }
+        }
+    }catch(e){
+        // ignore cleanup failures
+    }
+}
+
+function collectUidDbEntriesForSave(db){
+    const out = [];
+    const maxEntryBytes = Math.max(1024, UID_DB_SHARD_BYTES - 1024);
+    const keys = Object.keys((db && db.map) ? db.map : {}).sort();
+    for(let i = 0; i < keys.length; i++){
+        const uid = normalizeUidKey(keys[i]);
+        if(uid.length !== 3) continue;
+
+        const list = uidListFromRaw(db.map[uid]);
+        if(list.length === 0) continue;
+
+        const sorted = list.slice().sort();
+        const uniq = [];
+        let last = null;
+        for(let j = 0; j < sorted.length; j++){
+            const v = sorted[j];
+            if(v === last) continue;
+            uniq.push(v);
+            last = v;
+        }
+        if(uniq.length === 0) continue;
+
+        // Keep each uid entry chunk under the shard limit so one hot key cannot overflow a shard.
+        let part = [];
+        let partBytes = 64;
+        for(let j = 0; j < uniq.length; j++){
+            const val = uniq[j];
+            const valBytes = utf8ByteLength(JSON.stringify(val)) + 2;
+            if(part.length > 0 && partBytes + valBytes > maxEntryBytes){
+                const estA = utf8ByteLength(JSON.stringify(uid)) + utf8ByteLength(JSON.stringify(part)) + 24;
+                out.push({uid: uid, list: part, estimateBytes: estA});
+                part = [val];
+                partBytes = 64 + valBytes;
+                continue;
+            }
+            part.push(val);
+            partBytes += valBytes;
+        }
+        if(part.length > 0){
+            const estB = utf8ByteLength(JSON.stringify(uid)) + utf8ByteLength(JSON.stringify(part)) + 24;
+            out.push({uid: uid, list: part, estimateBytes: estB});
+        }
+    }
+    return out;
+}
+
+function buildUidDbShardText(entries){
+    const map = {};
+    for(let i = 0; i < entries.length; i++){
+        const uid = entries[i].uid;
+        if(!(uid in map)) map[uid] = [];
+        const list = entries[i].list;
+        for(let j = 0; j < list.length; j++) map[uid].push(list[j]);
+    }
+    return JSON.stringify({map: map}, null, 2);
+}
+
+function splitUidDbEntriesToShards(entries){
+    const shards = [];
+    let index = 0;
+
+    while(index < entries.length){
+        const start = index;
+        let estimate = 32;
+
+        while(index < entries.length){
+            const e = entries[index];
+            if(index > start && estimate + Number(e.estimateBytes || 0) > UID_DB_SHARD_BYTES) break;
+            estimate += Number(e.estimateBytes || 0);
+            index++;
+        }
+
+        if(index === start) index++;
+
+        let part = entries.slice(start, index);
+        let text = buildUidDbShardText(part);
+        let bytes = utf8ByteLength(text);
+
+        while(bytes > UID_DB_SHARD_BYTES && part.length > 1){
+            index--;
+            part = entries.slice(start, index);
+            text = buildUidDbShardText(part);
+            bytes = utf8ByteLength(text);
+        }
+
+        let pairCount = 0;
+        for(let i = 0; i < part.length; i++) pairCount += part[i].list.length;
+        shards.push({entries: part, text: text, bytes: bytes, pairCount: pairCount});
+    }
+
+    if(shards.length === 0){
+        const text = buildUidDbShardText([]);
+        shards.push({entries: [], text: text, bytes: utf8ByteLength(text), pairCount: 0});
+    }
+    return shards;
+}
+
+function normalizeUidDbMetaShape(meta){
+    const src = (meta && typeof meta === "object") ? meta : {};
+    return {
+        targetCount: Number(src.targetCount || 0),
+        foundCount: Number(src.foundCount || 0),
+        excludedSpecialCount: Number(src.excludedSpecialCount || 0),
+        excludedTimeoutCount: Number(src.excludedTimeoutCount || 0),
+        longIdCount: Number(src.longIdCount || 0),
+        checked: Number(src.checked || 0),
+        cores: Number(src.cores || 0),
+        lastBuildAt: Number(src.lastBuildAt || 0),
+        lastBuildSec: Number(src.lastBuildSec || 8)
+    };
+}
+
+function mergeUidMapIntoDb(db, rawMap){
+    if(rawMap == null || typeof rawMap !== "object" || Array.isArray(rawMap)) return;
+    for(var k in rawMap){
+        if(!Object.prototype.hasOwnProperty.call(rawMap, k)) continue;
+        const uid = normalizeUidKey(k);
+        if(uid.length !== 3) continue;
+        const vals = uidListFromRaw(rawMap[k]);
+        for(let i = 0; i < vals.length; i++) addUidPair(db, uid, vals[i]);
+    }
+}
+
+function loadUidDbFromManifest(fi, manifest){
+    const db = defaultUidDb();
+    if(manifest != null && typeof manifest.meta === "object" && manifest.meta != null){
+        db.meta = manifest.meta;
+    }
+    if(manifest != null && typeof manifest.map === "object" && manifest.map != null){
+        mergeUidMapIntoDb(db, manifest.map);
+    }
+
+    const shards = (manifest != null && Array.isArray(manifest.shards)) ? manifest.shards : [];
+    for(let i = 0; i < shards.length; i++){
+        const info = shards[i];
+        const name = ("" + (info && info.file ? info.file : "")).trim();
+        if(name.length === 0) continue;
+        try{
+            const sf = fi.parent().child(name);
+            if(!sf.exists()) continue;
+            const parsed = parseUidDbText(sf.readString());
+            if(parsed == null || typeof parsed !== "object") continue;
+            if(typeof parsed.map === "object" && parsed.map != null && !Array.isArray(parsed.map)){
+                mergeUidMapIntoDb(db, parsed.map);
+            }else{
+                mergeUidMapIntoDb(db, parsed);
+            }
+        }catch(e){
+            // skip broken shard and continue loading others
+        }
+    }
+
+    db.meta = normalizeUidDbMetaShape(db.meta);
+    return db;
+}
+
 function getUidDbMetaText(){
     maybeInvalidateUidDbCache();
     if(_uidDbMetaText.length > 0) return _uidDbMetaText;
@@ -860,10 +1053,36 @@ function getUidDbMetaText(){
         try{
             const fi = getUidDbFi();
             if(fi != null && fi.exists()){
-                const mb = Number(fi.length()) / 1024 / 1024;
+                let totalBytes = Number(fi.length());
+                let shardCount = 0;
+
+                // Only parse small manifest text here; avoid loading old monolithic DB during startup.
+                if(totalBytes <= 2 * 1024 * 1024){
+                    const manifest = parseUidDbText(fi.readString());
+                    if(manifest != null && typeof manifest === "object" && Array.isArray(manifest.shards)){
+                        shardCount = manifest.shards.length;
+                        for(let i = 0; i < manifest.shards.length; i++){
+                            const s = manifest.shards[i];
+                            const sb = Number(s && s.bytes ? s.bytes : 0);
+                            if(sb > 0){
+                                totalBytes += sb;
+                                continue;
+                            }
+                            const name = ("" + (s && s.file ? s.file : "")).trim();
+                            if(name.length === 0) continue;
+                            try{
+                                const sf = fi.parent().child(name);
+                                if(sf.exists()) totalBytes += Number(sf.length());
+                            }catch(e){ }
+                        }
+                    }
+                }
+
+                const mb = totalBytes / 1024 / 1024;
                 _uidDbMetaText = "\u6570\u636e\u5e93\u7edf\u8ba1:\n" +
                     "  \u2022 \u5df2\u68c0\u6d4b\u5230\u672c\u5730\u6570\u636e\u5e93\u6587\u4ef6\n" +
-                    "  \u2022 \u6587\u4ef6\u5927\u5c0f: " + Strings.autoFixed(mb, 2) + "MB\n" +
+                    "  \u2022 \u5206\u7247\u6570\u91cf: " + Math.max(1, shardCount) + "\n" +
+                    "  \u2022 \u603b\u5927\u5c0f: " + Strings.autoFixed(mb, 2) + "MB\n" +
                     "  \u2022 \u9996\u6b21\u67e5\u8be2/\u7a77\u4e3e\u65f6\u518d\u52a0\u8f7d";
                 return _uidDbMetaText;
             }
@@ -893,8 +1112,15 @@ function loadUidDb(){
 
     try{
         if(fi.exists()){
-            db = parseUidDbText(fi.readString());
-            loadedFromFile = (typeof db === "object" && db != null);
+            const parsed = parseUidDbText(fi.readString());
+            if(typeof parsed === "object" && parsed != null){
+                loadedFromFile = true;
+                if(Array.isArray(parsed.shards)){
+                    db = loadUidDbFromManifest(fi, parsed);
+                }else{
+                    db = parsed;
+                }
+            }
         }
     }catch(e){
         db = null;
@@ -940,15 +1166,7 @@ function loadUidDb(){
         recomputeUidDbMeta(db);
     }else{
         // Trusted on-disk DB generated by this mod; keep loading lightweight.
-        db.meta.targetCount = Number(db.meta.targetCount || 0);
-        db.meta.foundCount = Number(db.meta.foundCount || 0);
-        db.meta.longIdCount = Number(db.meta.longIdCount || 0);
-        db.meta.excludedSpecialCount = Number(db.meta.excludedSpecialCount || 0);
-        db.meta.excludedTimeoutCount = Number(db.meta.excludedTimeoutCount || 0);
-        db.meta.checked = Number(db.meta.checked || 0);
-        db.meta.cores = Number(db.meta.cores || 0);
-        db.meta.lastBuildAt = Number(db.meta.lastBuildAt || 0);
-        db.meta.lastBuildSec = Number(db.meta.lastBuildSec || 8);
+        db.meta = normalizeUidDbMetaShape(db.meta);
 
         if(!(db.meta.targetCount > 0) || db.meta.foundCount < 0){
             recomputeUidDbMeta(db);
@@ -958,9 +1176,10 @@ function loadUidDb(){
     // One-time migration from Arc settings string storage to external JSON file.
     if(migratedFromSettings){
         try{
-            fi.writeString(JSON.stringify(db), false);
-            Core.settings.remove(UID_DB_KEY);
-            saveSettingsCompat();
+            if(saveUidDb(db)){
+                Core.settings.remove(UID_DB_KEY);
+                saveSettingsCompat();
+            }
         }catch(e){
             // keep working from memory even if migration write fails
         }
@@ -973,13 +1192,44 @@ function loadUidDb(){
 
 function saveUidDb(db){
     try{
-        _uidDbCache = db;
-        _uidDbMetaText = uidDbMetaText(db);
         const fi = getUidDbFi();
         if(fi == null){
             return false;
         }
-        fi.writeString(JSON.stringify(db), false);
+
+        if(typeof db.map !== "object" || db.map == null || Array.isArray(db.map)) db.map = {};
+        if(typeof db.meta !== "object" || db.meta == null) db.meta = defaultUidDb().meta;
+        recomputeUidDbMeta(db);
+
+        const entries = collectUidDbEntriesForSave(db);
+        const shards = splitUidDbEntriesToShards(entries);
+
+        clearUidDbShardFiles(fi);
+
+        const shardInfos = [];
+        for(let i = 0; i < shards.length; i++){
+            const part = shards[i];
+            const fileName = uidDbShardFileName(i);
+            const sf = fi.parent().child(fileName);
+            sf.writeString(part.text, false);
+            shardInfos.push({
+                file: fileName,
+                bytes: Number(part.bytes || 0),
+                keyCount: Number(part.entries.length),
+                pairCount: Number(part.pairCount || 0)
+            });
+        }
+
+        const manifest = {
+            format: 2,
+            shardBytes: UID_DB_SHARD_BYTES,
+            meta: db.meta || {},
+            shards: shardInfos
+        };
+        fi.writeString(JSON.stringify(manifest, null, 2), false);
+
+        _uidDbCache = db;
+        _uidDbMetaText = uidDbMetaText(db);
         return true;
     }catch(e){
         Log.err("[uuidmanager] Failed to save uid db.");
@@ -998,6 +1248,94 @@ function exportUidDbToFile(pathText){
     return fi.absolutePath();
 }
 
+function createUidImportStats(){
+    return {
+        added: 0,
+        duplicate: 0,
+        invalid: 0,
+        mismatch: 0,
+        totalParsed: 0
+    };
+}
+
+function consumeUidImportPair(db, stats, uid, raw){
+    stats.totalParsed++;
+
+    const norm = normalizeUuidOrUid(raw);
+    if(!norm.valid){
+        stats.invalid++;
+        return;
+    }
+
+    const uuid8 = norm.uuid8;
+    const sid = getUidShortForUuid8(uuid8);
+    if(sid !== uid){
+        stats.mismatch++;
+        return;
+    }
+
+    if(addUidPair(db, uid, uuid8)){
+        stats.added++;
+    }else{
+        stats.duplicate++;
+    }
+}
+
+function finalizeUidImportResult(db, stats){
+    recomputeUidDbMeta(db, {
+        lastImportAt: Number(System.currentTimeMillis()),
+        lastImportAdded: stats.added,
+        lastImportDuplicate: stats.duplicate,
+        lastImportInvalid: stats.invalid,
+        lastImportMismatch: stats.mismatch
+    });
+
+    const saved = saveUidDb(db);
+    return {
+        ok: saved,
+        added: stats.added,
+        duplicate: stats.duplicate,
+        invalid: stats.invalid,
+        mismatch: stats.mismatch,
+        totalParsed: stats.totalParsed,
+        message: saved ? "\u5bfc\u5165\u5b8c\u6210" : "\u5bfc\u5165\u6210\u529f\u4f46\u4fdd\u5b58\u5931\u8d25"
+    };
+}
+
+function tryCollectImportedPairsFromText(text, onPair){
+    let jsonObj = null;
+    try{
+        jsonObj = JSON.parse(text);
+    }catch(e){
+        jsonObj = null;
+    }
+
+    if(jsonObj != null){
+        tryCollectImportedPairsFromObject(jsonObj, onPair);
+    }else{
+        tryCollectImportedPairsFromLines(text, onPair);
+    }
+}
+
+function importUidDbFromManifestFile(fi, manifest, db, stats){
+    tryCollectImportedPairsFromObject(manifest, (uid, raw) => consumeUidImportPair(db, stats, uid, raw));
+
+    const shards = Array.isArray(manifest.shards) ? manifest.shards : [];
+    for(let i = 0; i < shards.length; i++){
+        const info = shards[i];
+        const name = ("" + (info && info.file ? info.file : "")).trim();
+        if(name.length === 0) continue;
+        try{
+            const sf = fi.parent().child(name);
+            if(!sf.exists()) continue;
+            const text = sf.readString();
+            tryCollectImportedPairsFromText(text, (uid, raw) => consumeUidImportPair(db, stats, uid, raw));
+        }catch(e){
+            // Skip unreadable shard and continue import.
+        }
+    }
+}
+
 function importUidDbFromFile(pathText){
     const path = ("" + (pathText == null ? "" : pathText)).trim();
     if(path.length === 0) return {ok: false, message: "\u8bf7\u8f93\u5165\u6587\u4ef6\u8def\u5f84"};
@@ -1005,16 +1343,22 @@ function importUidDbFromFile(pathText){
     const fi = new Fi(path);
     if(!fi.exists()) return {ok: false, message: "\u6587\u4ef6\u4e0d\u5b58\u5728"};
 
-    const bytes = Number(fi.length());
-    if(bytes > IMPORT_MAX_FILE_BYTES){
-        const mb = Strings.autoFixed(bytes / 1024 / 1024, 1);
-        const maxMb = Strings.autoFixed(IMPORT_MAX_FILE_BYTES / 1024 / 1024, 0);
-        return {ok: false, message: "\u6587\u4ef6\u8fc7\u5927(" + mb + "MB)\uff0c\u8d85\u8fc7\u5bfc\u5165\u4e0a\u9650(" + maxMb + "MB)"};
-    }
-
     try{
+        const db = loadUidDb();
+        const stats = createUidImportStats();
+
         const text = fi.readString();
-        return importUidDbText(text);
+        const parsed = parseUidDbText(text);
+        if(parsed != null && typeof parsed === "object" && Array.isArray(parsed.shards)){
+            importUidDbFromManifestFile(fi, parsed, db, stats);
+        }else{
+            tryCollectImportedPairsFromText(text, (uid, raw) => consumeUidImportPair(db, stats, uid, raw));
+        }
+
+        if(stats.totalParsed === 0){
+            return {ok: false, message: "\u672a\u8bc6\u522b\u5230\u53ef\u5bfc\u5165\u8bb0\u5f55"};
+        }
+        return finalizeUidImportResult(db, stats);
     }catch(e){
         return {ok: false, message: "\u8bfb\u53d6\u6587\u4ef6\u5931\u8d25"};
     }
@@ -1503,70 +1847,14 @@ function importUidDbText(payload){
         return {ok: false, message: "\u7c98\u8d34\u677f\u4e3a\u7a7a"};
     }
 
-    let jsonObj = null;
-    try{
-        jsonObj = JSON.parse(text);
-    }catch(e){
-        jsonObj = null;
-    }
-
     const db = loadUidDb();
-    let added = 0;
-    let duplicate = 0;
-    let invalid = 0;
-    let mismatch = 0;
+    const stats = createUidImportStats();
+    tryCollectImportedPairsFromText(text, (uid, raw) => consumeUidImportPair(db, stats, uid, raw));
 
-    let totalParsed = 0;
-    const consume = (uid, raw) => {
-        totalParsed++;
-        const norm = normalizeUuidOrUid(raw);
-        if(!norm.valid){
-            invalid++;
-            return;
-        }
-
-        const uuid8 = norm.uuid8;
-        const sid = getUidShortForUuid8(uuid8);
-        if(sid !== uid){
-            mismatch++;
-            return;
-        }
-
-        if(addUidPair(db, uid, uuid8)){
-            added++;
-        }else{
-            duplicate++;
-        }
-    };
-
-    if(jsonObj != null){
-        tryCollectImportedPairsFromObject(jsonObj, consume);
-    }else{
-        tryCollectImportedPairsFromLines(text, consume);
-    }
-
-    if(totalParsed === 0){
+    if(stats.totalParsed === 0){
         return {ok: false, message: "\u672a\u8bc6\u522b\u5230\u53ef\u5bfc\u5165\u8bb0\u5f55"};
     }
-
-    recomputeUidDbMeta(db, {
-        lastImportAt: Number(System.currentTimeMillis()),
-        lastImportAdded: added,
-        lastImportDuplicate: duplicate,
-        lastImportInvalid: invalid,
-        lastImportMismatch: mismatch
-    });
-
-    const saved = saveUidDb(db);
-    return {
-        ok: saved,
-        added: added,
-        duplicate: duplicate,
-        invalid: invalid,
-        mismatch: mismatch,
-        totalParsed: totalParsed,
-        message: saved ? "\u5bfc\u5165\u5b8c\u6210" : "\u5bfc\u5165\u6210\u529f\u4f46\u4fdd\u5b58\u5931\u8d25"
-    };
+    return finalizeUidImportResult(db, stats);
 }
 
 function showUidDbMatchListDialog(uid3, list){
@@ -1714,7 +2002,7 @@ function showUidImportDialog(){
     dialog.cont.table(cons(t => {
         t.left();
         t.defaults().left().pad(6);
-        t.add("\u652f\u6301\u4ece\u526a\u8d34\u677f\u6216\u6587\u4ef6\u5bfc\u5165\u6570\u636e\u5e93").color(Pal.accent);
+        t.add("\u652f\u6301\u4ece\u526a\u8d34\u677f\u6216\u6587\u4ef6\u5bfc\u5165\u6570\u636e\u5e93(\u542b64MB+\u5206\u7247)").color(Pal.accent);
     })).growX().row();
 
     dialog.buttons.defaults().height(54).pad(4);
