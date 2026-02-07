@@ -664,7 +664,8 @@ function buildUidDbAll8s(onDone){
     const deadline = Number(System.currentTimeMillis()) + runMillis;
     const checked = new AtomicLong(0);
     const finished = new AtomicInteger(0);
-    const foundMap = new ConcurrentHashMap();
+    const maxFoundPairs = 200000;
+    const foundPairs = new ConcurrentHashMap();
 
     for(let wid = 0; wid < cores; wid++){
         const workerId = wid;
@@ -684,7 +685,10 @@ function buildUidDbAll8s(onDone){
                         const uid16 = b64Encode(uidBytes);
                         const sid = shortStrFromUid16WithDigest(uid16, digest);
                         if(sid.length === 3 && !isAllSpecialUid(sid)){
-                            foundMap.putIfAbsent(sid, b64Encode(uuidBytes));
+                            if(foundPairs.size() < maxFoundPairs){
+                                const pairKey = sid + "|" + b64Encode(uuidBytes);
+                                foundPairs.putIfAbsent(pairKey, true);
+                            }
                         }
                         checked.incrementAndGet();
                     }
@@ -710,13 +714,17 @@ function buildUidDbAll8s(onDone){
             Core.app.post(() => {
                 try{
                     const db = loadUidDb();
-                    const iter = foundMap.entrySet().iterator();
+                    const iter = foundPairs.keySet().iterator();
                     let addedPairs = 0;
                     while(iter.hasNext()){
-                        const e = iter.next();
-                        const k = "" + e.getKey();
-                        const v = "" + e.getValue();
-                        if(addUidPair(db, k, v)) addedPairs++;
+                        const pair = "" + iter.next();
+                        const sep = pair.indexOf("|");
+                        if(sep <= 0 || sep >= pair.length - 1) continue;
+                        const k = pair.substring(0, sep);
+                        const v = pair.substring(sep + 1);
+                        if(addUidPair(db, k, v)){
+                            addedPairs++;
+                        }
                     }
 
                     recomputeUidDbMeta(db, {
@@ -877,22 +885,34 @@ function showUidDbMatchListDialog(uid3, list){
     dialog.addCloseButton();
     dialog.closeOnBack();
 
+    const pageSize = 120;
+    let page = 0;
+    const total = list.length;
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+
     dialog.cont.table(cons(t => {
         t.left();
         t.defaults().left().pad(4);
-        t.add("\u5339\u914d\u5230\u957fid\u6570\u91cf: " + list.length).color(Pal.accent).row();
+        t.label(() => "\u5339\u914d\u5230\u957fid\u6570\u91cf: " + total + "  |  \u7b2c" + (page + 1) + "/" + pageCount + "\u9875")
+            .color(Pal.accent).left().row();
     })).growX().padBottom(8).row();
 
     const content = new Packages.arc.scene.ui.layout.Table();
     content.top().left();
     content.defaults().growX().left();
 
-    if(list.length === 0){
-        content.add("\u65e0\u5339\u914d\u7ed3\u679c").color(Pal.gray).left();
-    }else{
-        for(let i = 0; i < list.length; i++){
+    const rebuild = () => {
+        content.clear();
+        if(total === 0){
+            content.add("\u65e0\u5339\u914d\u7ed3\u679c").color(Pal.gray).left();
+            return;
+        }
+
+        const start = page * pageSize;
+        const end = Math.min(total, start + pageSize);
+        for(let i = start; i < end; i++){
             const v = "" + list[i];
-            content.table(Tex.whiteui, cons(row => {
+            content.table(cons(row => {
                 row.left();
                 row.defaults().pad(4).left();
                 row.add(v).color(Pal.lightishGray).growX();
@@ -900,14 +920,30 @@ function showUidDbMatchListDialog(uid3, list){
                     Core.app.setClipboardText(v);
                     popupInfo("\u60a8\u5df2\u590d\u5236");
                 }).size(44);
-            })).padBottom(6).growX();
+            })).padBottom(4).growX();
             content.row();
         }
-    }
+    };
+
+    rebuild();
 
     dialog.cont.pane(cons(p => {
         p.add(content).growX();
     })).grow().row();
+
+    dialog.buttons.defaults().size(160, 54).pad(4);
+    dialog.buttons.button("\u4e0a\u4e00\u9875", () => {
+        if(page > 0){
+            page--;
+            rebuild();
+        }
+    });
+    dialog.buttons.button("\u4e0b\u4e00\u9875", () => {
+        if(page < pageCount - 1){
+            page++;
+            rebuild();
+        }
+    });
 
     dialog.show();
 }
@@ -920,7 +956,15 @@ function showUidDbLookupDialog(){
             return;
         }
         const list = getUidListByUid(key);
-        showUidDbMatchListDialog(key, list);
+        // Show on next frame to avoid dialog transition conflicts with prompt hide().
+        Core.app.post(() => {
+            try{
+                showUidDbMatchListDialog(key, list);
+            }catch(e){
+                Log.err(e);
+                popupInfo("\u67e5\u8be2\u7a97\u53e3\u6253\u5f00\u5931\u8d25");
+            }
+        });
     });
 }
 
