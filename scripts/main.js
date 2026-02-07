@@ -11,6 +11,7 @@ const Events = Packages.arc.Events;
 const Log = Packages.arc.util.Log;
 const Strings = Packages.arc.util.Strings;
 const Align = Packages.arc.util.Align;
+const Bar = Packages.arc.scene.ui.Bar;
 const Fi = Packages.arc.files.Fi;
 const Http = Packages.arc.util.Http;
 const Jval = Packages.arc.util.serialization.Jval;
@@ -51,6 +52,9 @@ const UID_DB_FILE = "uuidmanager.uiddb.json";
 const UID_DB_SHARD_PREFIX = "uuidmanager.uiddb.part-";
 const UID_DB_SHARD_SUFFIX = ".json";
 const UID_DB_SHARD_BYTES = 64 * 1024 * 1024;
+const UID_BUILD_ROUNDS_KEY = "uuidmanager.uiddb.buildRounds";
+const UID_BUILD_MAX_ROUNDS = 99;
+const UID_BUILD_MAX_ITER = 5000000;
 const APPROVED_KEY = "uuidmanager.approved";
 const JOIN_ROW_NAME = "uuidmanager-join-row";
 const UPDATE_OWNER = "DeterMination-Wind";
@@ -946,6 +950,7 @@ function buildUidDbShardText(entries){
 }
 
 function splitUidDbEntriesToShards(entries){
+    // Only plans shard boundaries by estimate; actual shard text is generated and written sequentially.
     const shards = [];
     let index = 0;
 
@@ -955,32 +960,17 @@ function splitUidDbEntriesToShards(entries){
 
         while(index < entries.length){
             const e = entries[index];
-            if(index > start && estimate + Number(e.estimateBytes || 0) > UID_DB_SHARD_BYTES) break;
-            estimate += Number(e.estimateBytes || 0);
+            const est = Number(e.estimateBytes || 0);
+            if(index > start && estimate + est > UID_DB_SHARD_BYTES) break;
+            estimate += est;
             index++;
         }
-
         if(index === start) index++;
-
-        let part = entries.slice(start, index);
-        let text = buildUidDbShardText(part);
-        let bytes = utf8ByteLength(text);
-
-        while(bytes > UID_DB_SHARD_BYTES && part.length > 1){
-            index--;
-            part = entries.slice(start, index);
-            text = buildUidDbShardText(part);
-            bytes = utf8ByteLength(text);
-        }
-
-        let pairCount = 0;
-        for(let i = 0; i < part.length; i++) pairCount += part[i].list.length;
-        shards.push({entries: part, text: text, bytes: bytes, pairCount: pairCount});
+        shards.push({start: start, end: index, estimateBytes: estimate});
     }
 
     if(shards.length === 0){
-        const text = buildUidDbShardText([]);
-        shards.push({entries: [], text: text, bytes: utf8ByteLength(text), pairCount: 0});
+        shards.push({start: 0, end: 0, estimateBytes: 0});
     }
     return shards;
 }
@@ -1192,50 +1182,107 @@ function loadUidDb(){
 
 function saveUidDb(db){
     try{
-        const fi = getUidDbFi();
-        if(fi == null){
-            return false;
+        const ok = writeUidDbToDisk(db);
+        if(ok){
+            _uidDbCache = db;
+            _uidDbMetaText = uidDbMetaText(db);
         }
-
-        if(typeof db.map !== "object" || db.map == null || Array.isArray(db.map)) db.map = {};
-        if(typeof db.meta !== "object" || db.meta == null) db.meta = defaultUidDb().meta;
-        recomputeUidDbMeta(db);
-
-        const entries = collectUidDbEntriesForSave(db);
-        const shards = splitUidDbEntriesToShards(entries);
-
-        clearUidDbShardFiles(fi);
-
-        const shardInfos = [];
-        for(let i = 0; i < shards.length; i++){
-            const part = shards[i];
-            const fileName = uidDbShardFileName(i);
-            const sf = fi.parent().child(fileName);
-            sf.writeString(part.text, false);
-            shardInfos.push({
-                file: fileName,
-                bytes: Number(part.bytes || 0),
-                keyCount: Number(part.entries.length),
-                pairCount: Number(part.pairCount || 0)
-            });
-        }
-
-        const manifest = {
-            format: 2,
-            shardBytes: UID_DB_SHARD_BYTES,
-            meta: db.meta || {},
-            shards: shardInfos
-        };
-        fi.writeString(JSON.stringify(manifest, null, 2), false);
-
-        _uidDbCache = db;
-        _uidDbMetaText = uidDbMetaText(db);
-        return true;
+        return ok;
     }catch(e){
         Log.err("[uuidmanager] Failed to save uid db.");
         Log.err(e);
         return false;
     }
+}
+
+function writeUidDbToDisk(db){
+    const fi = getUidDbFi();
+    if(fi == null){
+        return false;
+    }
+
+    if(typeof db.map !== "object" || db.map == null || Array.isArray(db.map)) db.map = {};
+    if(typeof db.meta !== "object" || db.meta == null) db.meta = defaultUidDb().meta;
+    recomputeUidDbMeta(db);
+
+    const entries = collectUidDbEntriesForSave(db);
+
+    clearUidDbShardFiles(fi);
+
+    const shardInfos = [];
+    let shardIndex = 0;
+
+    let entryIndex = 0;
+    while(entryIndex < entries.length || (entries.length === 0 && shardIndex === 0)){
+        const start = entryIndex;
+
+        // Choose a shard boundary by estimate first.
+        let estimate = 32;
+        if(entries.length === 0){
+            entryIndex = 0;
+        }else{
+            while(entryIndex < entries.length){
+                const e = entries[entryIndex];
+                const est = Number(e.estimateBytes || 0);
+                if(entryIndex > start && estimate + est > UID_DB_SHARD_BYTES) break;
+                estimate += est;
+                entryIndex++;
+            }
+            if(entryIndex === start) entryIndex++;
+        }
+
+        let end = entryIndex;
+        if(end < start) end = start;
+
+        // Generate shard JSON and shrink by actual UTF-8 byte size if needed.
+        let part = (entries.length === 0) ? [] : entries.slice(start, end);
+        let text = buildUidDbShardText(part);
+        let bytes = utf8ByteLength(text);
+        while(bytes > UID_DB_SHARD_BYTES && end > start + 1){
+            end--;
+            part = entries.slice(start, end);
+            text = buildUidDbShardText(part);
+            bytes = utf8ByteLength(text);
+        }
+
+        // If we shrank, rewind for next shard.
+        if(entries.length > 0 && end !== entryIndex){
+            entryIndex = end;
+        }
+
+        const fileName = uidDbShardFileName(shardIndex);
+        shardIndex++;
+        const sf = fi.parent().child(fileName);
+        sf.writeString(text, false);
+
+        let pairCount = 0;
+        const keySet = {};
+        let keyCount = 0;
+        for(let j = 0; j < part.length; j++){
+            pairCount += part[j].list.length;
+            const uid = part[j].uid;
+            if(!(uid in keySet)){
+                keySet[uid] = true;
+                keyCount++;
+            }
+        }
+
+        shardInfos.push({
+            file: fileName,
+            bytes: Number(bytes || 0),
+            keyCount: Number(keyCount),
+            pairCount: Number(pairCount)
+        });
+    }
+
+    const manifest = {
+        format: 2,
+        shardBytes: UID_DB_SHARD_BYTES,
+        meta: db.meta || {},
+        shards: shardInfos
+    };
+    fi.writeString(JSON.stringify(manifest, null, 2), false);
+    return true;
 }
 
 function exportUidDbToFile(pathText){
@@ -1634,42 +1681,14 @@ function findUuid8ByUidShortParallel(targetUid, onDone){
     }
 }
 
-function buildUidDbAll8s(onDone, onProgress){
-    if(_uidBuildRunning){
-        toast("[accent]UID\u6570\u636e\u5e93\u6784\u5efa\u4e2d...[]");
-        return;
-    }
-
-    const dbBase = loadUidDb();
-    const targetInfo = getAllUidTargets();
-    const totalTargets = targetInfo.targets.length;
-    const existingCovered = new ConcurrentHashMap();
-    let existingCount = 0;
-    for(let i = 0; i < targetInfo.targets.length; i++){
-        const k = targetInfo.targets[i];
-        const list = uidListFromRaw(dbBase.map[k]);
-        if(list.length > 0){
-            existingCovered.put(k, true);
-            existingCount++;
-        }
-    }
-
-    _uidBuildRunning = true;
-    const runMillis = 8000;
+function buildUidDbAllOnce(maxIter, roundSeed, onDone, onProgress){
+    const maxTotal = Math.max(1, Number(maxIter || UID_BUILD_MAX_ITER));
     const cores = Math.max(1, Number(Runtime.getRuntime().availableProcessors()));
-    const deadline = Number(System.currentTimeMillis()) + runMillis;
     const checked = new AtomicLong(0);
     const finished = new AtomicInteger(0);
-    const step = 500000;
+    const step = 50000;
     const maxFoundPairs = 200000;
     const foundPairs = new ConcurrentHashMap();
-    const newCovered = new ConcurrentHashMap();
-
-    if(typeof onProgress === "function"){
-        try{
-            onProgress({checked: 0, covered: existingCount, total: totalTargets});
-        }catch(e){ }
-    }
 
     for(let wid = 0; wid < cores; wid++){
         const workerId = wid;
@@ -1677,12 +1696,13 @@ function buildUidDbAll8s(onDone, onProgress){
             run: function(){
                 let localChecked = 0;
                 try{
-                    const seed = Number(System.nanoTime()) + workerId * 1103515245;
+                    const seed = Number(roundSeed || System.nanoTime()) + workerId * 1103515245;
                     const rng = new Random(seed);
                     const digest = MessageDigest.getInstance("MD5");
                     const uuidBytes = ReflectArray.newInstance(Packages.java.lang.Byte.TYPE, 8);
 
-                    while(Number(System.currentTimeMillis()) < deadline){
+                    // Spread iterations across workers so total attempts ~= maxTotal.
+                    for(let i = workerId; i < maxTotal; i += cores){
                         rng.nextBytes(uuidBytes);
                         const uidBytes = computeUidBytesFromUuidBytes(uuidBytes);
                         if(uidBytes == null) continue;
@@ -1690,14 +1710,13 @@ function buildUidDbAll8s(onDone, onProgress){
                         const uid16 = b64Encode(uidBytes);
                         const sid = shortStrFromUid16WithDigest(uid16, digest);
                         if(sid.length === 3 && !isAllSpecialUid(sid)){
+                            // Keep memory bounded; DB merge happens after a round.
                             if(foundPairs.size() < maxFoundPairs){
                                 const pairKey = sid + "|" + b64Encode(uuidBytes);
                                 foundPairs.putIfAbsent(pairKey, true);
                             }
-                            if(!existingCovered.containsKey(sid)){
-                                newCovered.putIfAbsent(sid, true);
-                            }
                         }
+
                         localChecked++;
                         if(localChecked >= step){
                             checked.addAndGet(localChecked);
@@ -1720,71 +1739,183 @@ function buildUidDbAll8s(onDone, onProgress){
 
     const waiter = new Runnable({
         run: function(){
-            let lastStep = -1;
-            let lastCovered = -1;
+            let lastPercent = -1;
             while(finished.get() < cores){
-                const c = Number(checked.get());
-                const coveredNow = Math.min(totalTargets, existingCount + newCovered.size());
-                const stepNow = Math.floor(c / step);
-                if(typeof onProgress === "function" && (stepNow !== lastStep || coveredNow !== lastCovered)){
-                    lastStep = stepNow;
-                    lastCovered = coveredNow;
+                const c = Math.min(maxTotal, Number(checked.get()));
+                const percent = Math.floor((c / maxTotal) * 100);
+                if(typeof onProgress === "function" && percent !== lastPercent){
+                    lastPercent = percent;
                     Core.app.post(() => {
-                        try{ onProgress({checked: c, covered: coveredNow, total: totalTargets}); }catch(e){ }
+                        try{ onProgress({checked: c, total: maxTotal, percent: percent}); }catch(e){ }
                     });
                 }
                 try{ Packages.java.lang.Thread.sleep(50); }catch(e){ }
             }
 
+            const finalChecked = Math.min(maxTotal, Number(checked.get()));
             if(typeof onProgress === "function"){
-                const c = Number(checked.get());
-                const coveredNow = Math.min(totalTargets, existingCount + newCovered.size());
                 Core.app.post(() => {
-                    try{ onProgress({checked: c, covered: coveredNow, total: totalTargets}); }catch(e){ }
+                    try{ onProgress({checked: finalChecked, total: maxTotal, percent: 100}); }catch(e){ }
                 });
             }
 
-            Core.app.post(() => {
-                try{
-                    const db = loadUidDb();
-                    const iter = foundPairs.keySet().iterator();
-                    let addedPairs = 0;
-                    while(iter.hasNext()){
-                        const pair = "" + iter.next();
-                        const sep = pair.indexOf("|");
-                        if(sep <= 0 || sep >= pair.length - 1) continue;
-                        const k = pair.substring(0, sep);
-                        const v = pair.substring(sep + 1);
-                        if(addUidPair(db, k, v)){
-                            addedPairs++;
-                        }
+            if(typeof onDone === "function"){
+                Core.app.post(() => {
+                    try{
+                        onDone({
+                            ok: true,
+                            checked: finalChecked,
+                            total: maxTotal,
+                            cores: cores,
+                            foundPairs: foundPairs
+                        });
+                    }catch(e){
+                        Log.err(e);
+                        onDone({ok: false, error: "callback"});
                     }
-
-                    recomputeUidDbMeta(db, {
-                        checked: Number(checked.get()),
-                        cores: cores,
-                        lastBuildAt: Number(System.currentTimeMillis()),
-                        lastBuildSec: 8,
-                        lastAddedPairs: addedPairs
-                    });
-
-                    const saved = saveUidDb(db);
-                    _uidBuildRunning = false;
-
-                    if(typeof onDone === "function"){
-                        onDone({ok: saved, meta: db.meta});
-                    }
-                }catch(e){
-                    _uidBuildRunning = false;
-                    if(typeof onDone === "function") onDone({ok: false, error: "save"});
-                }
-            });
+                });
+            }
         }
     });
 
     const waiterThread = new Packages.java.lang.Thread(waiter, "uuidmanager-uiddb-waiter");
     waiterThread.setDaemon(true);
     waiterThread.start();
+}
+
+function parseBuildRoundsText(text){
+    const raw = ("" + (text == null ? "" : text)).trim();
+    let n = 1;
+    try{ n = parseInt(raw, 10); }catch(e){ n = 1; }
+    if(!isFinite(n)) n = 1;
+    n = Math.max(1, Math.min(UID_BUILD_MAX_ROUNDS, Math.floor(n)));
+    return n;
+}
+
+function getBuildRoundsSetting(){
+    try{
+        return parseBuildRoundsText(Core.settings.getString(UID_BUILD_ROUNDS_KEY, "1"));
+    }catch(e){
+        return 1;
+    }
+}
+
+function setBuildRoundsSetting(n){
+    const v = Math.max(1, Math.min(UID_BUILD_MAX_ROUNDS, Math.floor(Number(n || 1))));
+    try{
+        Core.settings.put(UID_BUILD_ROUNDS_KEY, "" + v);
+        saveSettingsCompat();
+    }catch(e){
+        // ignore
+    }
+    return v;
+}
+
+function buildUidDbRounds(rounds, onDone, onProgress){
+    if(_uidBuildRunning){
+        toast("[accent]UID\u6570\u636e\u5e93\u6784\u5efa\u4e2d...[]");
+        return;
+    }
+
+    const nRounds = Math.max(1, Math.min(UID_BUILD_MAX_ROUNDS, Math.floor(Number(rounds || 1))));
+    _uidBuildRunning = true;
+
+    const db = loadUidDb();
+    const totalIter = nRounds * UID_BUILD_MAX_ITER;
+    const startedAt = Number(System.currentTimeMillis());
+    let roundIndex = 1;
+    let totalChecked = 0;
+    let totalAddedPairs = 0;
+    let coresUsed = 1;
+
+    const emit = (stage, percent) => {
+        if(typeof onProgress !== "function") return;
+        const p = Math.max(0, Math.min(100, Math.floor(Number(percent || 0))));
+        try{ onProgress({stage: stage, percent: p, round: roundIndex}); }catch(e){ }
+    };
+
+    const runRound = () => {
+        emit("bruteforce", Math.floor((totalChecked / totalIter) * 100));
+        buildUidDbAllOnce(UID_BUILD_MAX_ITER, Number(System.nanoTime()) + roundIndex * 1337, result => {
+            if(!result || !result.ok){
+                _uidBuildRunning = false;
+                if(typeof onDone === "function") onDone({ok: false, error: "round"});
+                return;
+            }
+
+            coresUsed = Number(result.cores || coresUsed);
+            totalChecked += Number(result.checked || 0);
+
+            // Merge new pairs into local DB (always additive).
+            let addedPairs = 0;
+            try{
+                const iter = result.foundPairs.keySet().iterator();
+                while(iter.hasNext()){
+                    const pair = "" + iter.next();
+                    const sep = pair.indexOf("|");
+                    if(sep <= 0 || sep >= pair.length - 1) continue;
+                    const k = pair.substring(0, sep);
+                    const v = pair.substring(sep + 1);
+                    if(addUidPair(db, k, v)) addedPairs++;
+                }
+            }catch(e){
+                // ignore merge failure
+            }
+            totalAddedPairs += addedPairs;
+
+            const overallPercent = Math.floor((totalChecked / totalIter) * 100);
+            emit("bruteforce", overallPercent);
+
+            if(roundIndex < nRounds){
+                roundIndex++;
+                Core.app.post(runRound);
+                return;
+            }
+
+            // Final save stage (may take time on large DB).
+            emit("save", 100);
+            const saver = new Runnable({
+                run: function(){
+                    try{
+                        // Patch metadata once; save() will recompute coverage counts.
+                        if(typeof db.meta !== "object" || db.meta == null) db.meta = defaultUidDb().meta;
+                        db.meta.checked = Number(db.meta.checked || 0) + totalChecked;
+                        db.meta.cores = Number(coresUsed || db.meta.cores || 0);
+                        db.meta.lastBuildAt = Number(System.currentTimeMillis());
+                        db.meta.lastBuildSec = Math.max(1, Math.floor((Number(System.currentTimeMillis()) - startedAt) / 1000));
+                        db.meta.lastBuildRounds = nRounds;
+                        db.meta.lastAddedPairs = totalAddedPairs;
+
+                        const saved = saveUidDb(db);
+                        _uidBuildRunning = false;
+                        if(typeof onDone === "function"){
+                            Core.app.post(() => {
+                                try{ onDone({ok: saved, meta: db.meta}); }catch(e){ }
+                            });
+                        }
+                    }catch(e){
+                        _uidBuildRunning = false;
+                        if(typeof onDone === "function"){
+                            Core.app.post(() => {
+                                try{ onDone({ok: false, error: "save"}); }catch(e2){ }
+                            });
+                        }
+                    }
+                }
+            });
+
+            const saveThread = new Packages.java.lang.Thread(saver, "uuidmanager-uiddb-save");
+            saveThread.setDaemon(true);
+            saveThread.start();
+        }, prog => {
+            const c = Number(prog && prog.checked ? prog.checked : 0);
+            const overall = Math.min(totalIter, totalChecked + c);
+            const percent = Math.floor((overall / totalIter) * 100);
+            emit("bruteforce", percent);
+        });
+    };
+
+    runRound();
 }
 
 function tryCollectImportedPairsFromObject(obj, onPair){
@@ -1945,33 +2076,25 @@ function showUidDbLookupDialog(){
     });
 }
 
-function makeAsciiProgressBar(current, total, width){
-    const w = Math.max(10, Number(width || 28));
-    if(total <= 0) return "[" + new Array(w + 1).join("-") + "]";
-    const ratio = Math.max(0, Math.min(1, current / total));
-    const fill = Math.floor(ratio * w);
-    let s = "[";
-    for(let i = 0; i < w; i++) s += (i < fill ? "#" : "-");
-    s += "]";
-    return s;
-}
-
 function showUidBruteforceProgressDialog(){
+    const rounds = getBuildRoundsSetting();
     const dialog = new BaseDialog("UID\u7a77\u4e3e\u8fdb\u5ea6");
     dialog.closeOnBack();
 
-    let covered = 0;
-    let total = getAllUidTargets().targets.length;
-    let checked = 0;
+    let stageText = "\u51c6\u5907\u4e2d";
+    let percentText = "0%";
+    let progressValue = 0;
 
     dialog.cont.table(cons(t => {
-        t.left();
-        t.defaults().left().pad(6);
-        t.label(() => {
-            return "\u8fdb\u5ea6: " + covered + "/" + total + "\n" +
-                makeAsciiProgressBar(covered, total, 32) + "\n" +
-                "\u7a77\u4e3e\u6b21\u6570: " + checked + " (\u6bcf50\u4e07\u6b21\u66f4\u65b0\u4e00\u6b65)";
-        }).color(Pal.lightishGray).left().wrap().width(720);
+        t.center();
+        t.defaults().center().pad(10);
+
+        const stage = t.label(() => stageText).color(Pal.lightishGray).center().get();
+        try{ stage.setAlignment(Align.center); }catch(e){ }
+        t.row();
+
+        const bar = new Bar(() => percentText, () => Pal.accent, () => progressValue);
+        t.add(bar).width(720).height(26).center();
     })).growX().row();
 
     dialog.buttons.defaults().size(220, 54).pad(4);
@@ -1979,7 +2102,7 @@ function showUidBruteforceProgressDialog(){
 
     dialog.show();
 
-    buildUidDbAll8s(result => {
+    buildUidDbRounds(rounds, result => {
         try{ dialog.hide(); }catch(e){ }
 
         if(!result || !result.ok){
@@ -1989,9 +2112,17 @@ function showUidBruteforceProgressDialog(){
         const m = result.meta;
         popupInfo("\u6784\u5efa\u5b8c\u6210\n\u77edUID\u8986\u76d6: " + m.foundCount + "/" + m.targetCount + "\n\u957fid\u603b\u6570: " + (m.longIdCount || 0));
     }, prog => {
-        covered = Number(prog.covered || 0);
-        total = Number(prog.total || total);
-        checked = Number(prog.checked || checked);
+        const p = Math.max(0, Math.min(100, Number(prog && prog.percent ? prog.percent : 0)));
+        progressValue = p / 100;
+        percentText = Math.floor(p) + "%";
+
+        const st = "" + (prog && prog.stage ? prog.stage : "");
+        if(st === "save"){
+            stageText = "\u4fdd\u5b58\u4e2d";
+        }else{
+            // Avoid x/y formatting; only mention the round number.
+            stageText = "\u7a77\u4e3e\u4e2d \u7b2c" + Number(prog && prog.round ? prog.round : 1) + "\u8f6e";
+        }
     });
 }
 
@@ -2826,11 +2957,35 @@ function addSettingsCategory(){
             return getUidDbMetaText();
         }).color(Pal.lightishGray).left().wrap().width(680).row();
 
-        table.button("\u7a77\u4e3e\u6240\u67093\u4f4dUID(8\u79d2)", Icon.bookSmall, Styles.cleart, () => {
-            ensureApprovedWithWarning(() => {
-                showUidBruteforceProgressDialog();
+        table.table(cons(row => {
+            row.left();
+            row.defaults().pad(4).left();
+
+            row.add("\u8f6e\u6570").width(60);
+
+            const initRounds = getBuildRoundsSetting();
+            let suppress = false;
+            const roundsField = row.field("" + initRounds, () => {}).width(90).height(54).get();
+            roundsField.setMessageText("1-99");
+            roundsField.setMaxLength(2);
+            roundsField.changed(() => {
+                if(suppress) return;
+                suppress = true;
+                const v = setBuildRoundsSetting(parseBuildRoundsText(roundsField.getText()));
+                roundsField.setText("" + v);
+                suppress = false;
             });
-        }).height(54).growX().row();
+
+            row.button("\u7a77\u4e3e\u6240\u67093\u4f4dUID", Icon.bookSmall, Styles.cleart, () => {
+                ensureApprovedWithWarning(() => {
+                    const v = setBuildRoundsSetting(parseBuildRoundsText(roundsField.getText()));
+                    suppress = true;
+                    roundsField.setText("" + v);
+                    suppress = false;
+                    showUidBruteforceProgressDialog();
+                });
+            }).height(54).growX();
+        })).growX().row();
 
         table.button("\u5bfc\u5165UID\u6570\u636e\u5e93", Icon.copySmall, Styles.cleart, () => {
             showUidImportDialog();

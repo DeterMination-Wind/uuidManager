@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.3.2`
+Current version: `v1.4.0`
 
 ## Features
 
@@ -11,13 +11,19 @@ Current version: `v1.3.2`
 - Save multiple UUIDs with notes and quick switching.
 - Per-server auto-switch by exact `ip:port`.
 - Built-in UID database:
-  - Run `Bruteforce all 3-char UIDs (8s)` from settings.
+  - Run `Bruteforce all 3-char UIDs` from settings (supports rounds).
   - Import databases from clipboard, deduplicated by `uid3 + long id`.
   - Settings lookup lists all long IDs for the same 3-char UID with per-item copy buttons.
   - Query from settings or directly in Join Game after DB build.
 - Built-in GitHub update checker: auto-detects new releases, shows release notes, and supports in-game package download.
 
 ## Changelog
+
+### v1.4.0
+
+- Fix a possible freeze after bruteforce finishes when entering the save step (save runs in background and uses lower memory).
+- Add a "rounds" input (<100) next to the bruteforce button to run multiple rounds and merge into local DB.
+- Replace ASCII progress with native progress bar: centered text, percentage only.
 
 ### v1.3.2
 
@@ -34,8 +40,8 @@ Current version: `v1.3.2`
 
 Import built artifacts into Mindustry mods folder:
 
-- Recommended: `构建/uuidmanager-1.3.2.zip`
-- Alternative: `构建/uuidmanager-1.3.2.jar`
+- Recommended: `构建/uuidmanager-1.4.0.zip`
+- Alternative: `构建/uuidmanager-1.4.0.jar`
 
 ## Build Locally
 
