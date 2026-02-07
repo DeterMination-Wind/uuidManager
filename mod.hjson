@@ -5,7 +5,7 @@ displayName: "UUID Manager"
 name: "uuidmanager"
 
 # the mod version
-version: 1.2.2
+version: 1.2.3
 
 # the minimum game build required to run this mod
 minGameVersion: 154
