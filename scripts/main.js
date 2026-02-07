@@ -12,6 +12,8 @@ const Log = Packages.arc.util.Log;
 const Strings = Packages.arc.util.Strings;
 const Align = Packages.arc.util.Align;
 const Fi = Packages.arc.files.Fi;
+const Http = Packages.arc.util.Http;
+const Jval = Packages.arc.util.serialization.Jval;
 
 const Base64Coder = Packages.arc.util.serialization.Base64Coder;
 const CRC32 = Packages.java.util.zip.CRC32;
@@ -47,6 +49,12 @@ const UID_DB_KEY = "uuidmanager.uiddb";
 const UID_DB_FILE = "uuidmanager.uiddb.json";
 const APPROVED_KEY = "uuidmanager.approved";
 const JOIN_ROW_NAME = "uuidmanager-join-row";
+const UPDATE_OWNER = "DeterMination-Wind";
+const UPDATE_REPO = "uuidManager";
+const UPDATE_MOD_NAME = "uuidmanager";
+const UPDATE_IGNORE_KEY = "uuidmanager.update.ignore";
+const UPDATE_LAST_AT_KEY = "uuidmanager.update.lastAt";
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const APPROVAL_CODE_XOR = [
     9, 43, 43, 190, 197, 232, 139, 156, 130, 163, 48, 126,
     67, 127, 37, 44, 9, 21, 188, 220, 205, 135, 169, 148,
@@ -62,6 +70,8 @@ let _uidBuildRunning = false;
 let _uidDbCache = null;
 let _uidDbMetaText = "";
 let _approvalCodeCache = null;
+let _updateChecked = false;
+let _latestReleaseInfo = null;
 
 function tr(key){
     // Mindustry UI treats strings starting with '@' as bundle keys in many helpers,
@@ -101,6 +111,325 @@ function saveSettingsCompat(){
     }catch(e){
         // ignore compatibility failures; settings are still put() into memory.
     }
+}
+
+function normalizeVersion(raw){
+    let s = "" + (raw == null ? "" : raw);
+    s = s.trim();
+    if(s.startsWith("v") || s.startsWith("V")) s = s.substring(1).trim();
+    return s;
+}
+
+function parseVersionParts(v){
+    const s = normalizeVersion(v);
+    const m = s.match(/\d+/g);
+    if(m == null) return [];
+    const out = [];
+    for(let i = 0; i < m.length; i++){
+        const n = parseInt(m[i], 10);
+        if(!isNaN(n)) out.push(n);
+    }
+    return out;
+}
+
+function compareVersions(a, b){
+    const pa = parseVersionParts(a);
+    const pb = parseVersionParts(b);
+    const max = Math.max(pa.length, pb.length);
+    for(let i = 0; i < max; i++){
+        const ai = i < pa.length ? pa[i] : 0;
+        const bi = i < pb.length ? pb[i] : 0;
+        if(ai !== bi) return ai > bi ? 1 : -1;
+    }
+    return 0;
+}
+
+function formatBytes(bytes){
+    const b = Number(bytes || 0);
+    if(!(b > 0)) return "";
+    const mb = b / 1024 / 1024;
+    if(mb < 10) return Strings.autoFixed(mb, 2) + "MB";
+    if(mb < 100) return Strings.autoFixed(mb, 1) + "MB";
+    return Math.floor(mb) + "MB";
+}
+
+function getCurrentModVersion(){
+    try{
+        if(Vars.mods == null) return "";
+        const mod = Vars.mods.getMod(UPDATE_MOD_NAME);
+        if(mod == null || mod.meta == null) return "";
+        return normalizeVersion(mod.meta.version || "");
+    }catch(e){
+        return "";
+    }
+}
+
+function getUpdateApiUrl(){
+    return "https://api.github.com/repos/" + UPDATE_OWNER + "/" + UPDATE_REPO + "/releases/latest";
+}
+
+function getReleasePageUrl(){
+    return "https://github.com/" + UPDATE_OWNER + "/" + UPDATE_REPO + "/releases";
+}
+
+function parseLatestRelease(json){
+    if(json == null || !json.isObject()) return null;
+    const tag = normalizeVersion(json.getString("tag_name", ""));
+    const name = "" + json.getString("name", "");
+    const version = tag.length > 0 ? tag : normalizeVersion(name);
+    if(version.length === 0) return null;
+
+    const htmlUrl = "" + json.getString("html_url", getReleasePageUrl());
+    const body = "" + json.getString("body", "");
+    const publishedAt = "" + json.getString("published_at", "");
+    const pre = !!json.getBool("prerelease", false);
+    const assets = [];
+
+    try{
+        const arrVal = json.get("assets");
+        if(arrVal != null && arrVal.isArray()){
+            const arr = arrVal.asArray();
+            for(let i = 0; i < arr.size; i++){
+                const a = arr.get(i);
+                if(a == null || !a.isObject()) continue;
+                const aname = "" + a.getString("name", "");
+                const aurl = "" + a.getString("browser_download_url", "");
+                const asize = Number(a.getLong("size", -1));
+                if(aname.length === 0 || aurl.length === 0) continue;
+                assets.push({name: aname, url: aurl, sizeBytes: asize});
+            }
+        }
+    }catch(e){
+        // ignore malformed assets
+    }
+
+    return {
+        version: version,
+        tag: tag,
+        name: name,
+        htmlUrl: htmlUrl,
+        body: body,
+        publishedAt: publishedAt,
+        preRelease: pre,
+        assets: assets
+    };
+}
+
+function pickDefaultReleaseAsset(rel){
+    if(rel == null || !Array.isArray(rel.assets) || rel.assets.length === 0) return null;
+    const mobile = !!Vars.mobile;
+    if(mobile){
+        for(let i = 0; i < rel.assets.length; i++){
+            const n = rel.assets[i].name.toLowerCase();
+            if(n.endsWith(".jar")) return rel.assets[i];
+        }
+    }else{
+        for(let i = 0; i < rel.assets.length; i++){
+            const n = rel.assets[i].name.toLowerCase();
+            if(n.endsWith(".zip")) return rel.assets[i];
+        }
+    }
+    return rel.assets[0];
+}
+
+function downloadReleaseAsset(rel, asset){
+    if(rel == null || asset == null || !asset.url){
+        popupInfo("\u6ca1\u6709\u53ef\u7528\u7684\u4e0b\u8f7d\u6587\u4ef6");
+        return;
+    }
+
+    const tmpDir = Vars.tmpDirectory.child("uuidmanager-update");
+    tmpDir.mkdirs();
+    const tmpFile = tmpDir.child(asset.name);
+    const finalFile = Vars.modDirectory.child(asset.name);
+
+    const canceled = {v: false};
+    const readBytes = {v: 0};
+    const totalBytes = {v: Math.max(0, Number(asset.sizeBytes || 0))};
+
+    const d = new BaseDialog("\u4e0b\u8f7d\u66f4\u65b0");
+    d.closeOnBack();
+    d.cont.table(cons(t => {
+        t.left();
+        t.defaults().left().pad(6);
+        t.add(() => {
+            const mb = readBytes.v / 1024 / 1024;
+            if(totalBytes.v > 0){
+                const ratio = Math.max(0, Math.min(1, readBytes.v / totalBytes.v));
+                return "\u4e0b\u8f7d: " + asset.name + "\n" +
+                    Strings.autoFixed(ratio * 100, 1) + "%  (" + Strings.autoFixed(mb, 2) + "/" + Strings.autoFixed(totalBytes.v / 1024 / 1024, 2) + " MB)";
+            }
+            return "\u4e0b\u8f7d: " + asset.name + "\n" + Strings.autoFixed(mb, 2) + " MB";
+        }).wrap().width(680);
+    })).growX().row();
+    d.buttons.defaults().size(180, 54).pad(4);
+    d.buttons.button("\u53d6\u6d88", () => {
+        canceled.v = true;
+        d.hide();
+    });
+    d.show();
+
+    Http.get(asset.url)
+        .timeout(30000)
+        .header("User-Agent", "Mindustry")
+        .error(e => Core.app.post(() => {
+            try{ d.hide(); }catch(err){ }
+            popupInfo("\u4e0b\u8f7d\u5931\u8d25");
+        }))
+        .submit(res => {
+            let input = null;
+            let out = null;
+            try{
+                const len = Number(res.getContentLength());
+                if(len > 0) totalBytes.v = len;
+                input = res.getResultAsStream();
+                out = tmpFile.write(false, 1024 * 256);
+                const buf = ReflectArray.newInstance(Packages.java.lang.Byte.TYPE, 1024 * 128);
+                while(true){
+                    if(canceled.v) break;
+                    const r = input.read(buf);
+                    if(r < 0) break;
+                    out.write(buf, 0, r);
+                    readBytes.v += r;
+                }
+                try{ out.flush(); }catch(e){ }
+            }catch(e){
+                try{ if(tmpFile.exists()) tmpFile.delete(); }catch(err){ }
+                Core.app.post(() => {
+                    try{ d.hide(); }catch(err){ }
+                    popupInfo("\u4e0b\u8f7d\u5931\u8d25");
+                });
+                return;
+            }finally{
+                try{ if(out != null) out.close(); }catch(e){ }
+                try{ if(input != null) input.close(); }catch(e){ }
+            }
+
+            if(canceled.v){
+                try{ if(tmpFile.exists()) tmpFile.delete(); }catch(e){ }
+                return;
+            }
+
+            Core.app.post(() => {
+                try{ d.hide(); }catch(err){ }
+                try{
+                    tmpFile.copyTo(finalFile);
+                    try{ tmpFile.delete(); }catch(e){ }
+                    popupInfo("\u4e0b\u8f7d\u5b8c\u6210\uff0c\u5df2\u5199\u5165:\n" + finalFile.absolutePath() + "\n\u8bf7\u91cd\u542f\u6e38\u620f\u751f\u6548");
+                }catch(e){
+                    popupInfo("\u5df2\u4e0b\u8f7d\u5230\u4e34\u65f6\u6587\u4ef6:\n" + tmpFile.absolutePath() + "\n\u8bf7\u624b\u52a8\u590d\u5236\u5230mods\u76ee\u5f55");
+                }
+            });
+        });
+}
+
+function showUpdateDialog(current, rel, fromManual){
+    if(rel == null) return;
+    const dialog = new BaseDialog("UUID Manager \u66f4\u65b0");
+    dialog.addCloseButton();
+    dialog.closeOnBack();
+
+    dialog.cont.table(cons(t => {
+        t.left();
+        t.defaults().left().pad(4);
+        t.add("\u5f53\u524d\u7248\u672c: " + current).color(Pal.lightishGray).row();
+        t.add("\u6700\u65b0\u7248\u672c: " + rel.version + (rel.preRelease ? " (pre)" : "")).color(Pal.accent).row();
+        if(rel.publishedAt && rel.publishedAt.length > 0){
+            t.add("\u53d1\u5e03\u65f6\u95f4: " + rel.publishedAt).color(Pal.lightishGray).row();
+        }
+        if(rel.body && rel.body.length > 0){
+            t.add("\u66f4\u65b0\u8bf4\u660e:").padTop(6).row();
+            t.pane(cons(p => {
+                p.add(rel.body).wrap().left().growX();
+            })).width(720).height(Math.min(300, Core.graphics.getHeight() * 0.35)).row();
+        }
+    })).growX().row();
+
+    if(Array.isArray(rel.assets) && rel.assets.length > 0){
+        dialog.cont.table(cons(t => {
+            t.left();
+            t.defaults().left().pad(4);
+            t.add("\u4e0b\u8f7d\u6587\u4ef6:").padTop(8).row();
+            for(let i = 0; i < rel.assets.length; i++){
+                const a = rel.assets[i];
+                const suffix = formatBytes(a.sizeBytes);
+                const label = suffix.length > 0 ? (a.name + " (" + suffix + ")") : a.name;
+                t.button(label, Styles.cleart, () => downloadReleaseAsset(rel, a)).width(720).height(44).left().row();
+            }
+        })).growX().row();
+    }
+
+    dialog.buttons.defaults().size(200, 54).pad(4);
+    dialog.buttons.button("\u6253\u5f00Release\u9875", Icon.link, () => Core.app.openURI(rel.htmlUrl || getReleasePageUrl()));
+    dialog.buttons.button("\u5ffd\u7565\u6b64\u7248\u672c", Icon.cancel, () => {
+        Core.settings.put(UPDATE_IGNORE_KEY, rel.version);
+        saveSettingsCompat();
+        dialog.hide();
+    });
+    if(fromManual){
+        dialog.buttons.button("\u5173\u95ed", Icon.ok, () => dialog.hide());
+    }
+    dialog.show();
+}
+
+function resolveLatestRelease(manual){
+    const api = getUpdateApiUrl();
+    Http.get(api)
+        .timeout(30000)
+        .header("User-Agent", "Mindustry")
+        .error(e => {
+            if(manual){
+                Core.app.post(() => popupInfo("\u68c0\u67e5\u66f4\u65b0\u5931\u8d25"));
+            }
+        })
+        .submit(res => {
+            let rel = null;
+            try{
+                rel = parseLatestRelease(Jval.read(res.getResultAsString()));
+            }catch(e){
+                rel = null;
+            }
+            if(rel == null){
+                if(manual){
+                    Core.app.post(() => popupInfo("\u672a\u80fd\u89e3\u6790\u6700\u65b0\u7248\u672c\u4fe1\u606f"));
+                }
+                return;
+            }
+
+            _latestReleaseInfo = rel;
+            const current = getCurrentModVersion();
+            const cmp = compareVersions(rel.version, current);
+            const ignore = normalizeVersion(Core.settings.getString(UPDATE_IGNORE_KEY, ""));
+            if(!manual && ignore.length > 0 && compareVersions(rel.version, ignore) <= 0) return;
+
+            if(cmp > 0){
+                Core.app.post(() => showUpdateDialog(current, rel, manual));
+            }else if(manual){
+                Core.app.post(() => popupInfo("\u5df2\u662f\u6700\u65b0\u7248\u672c: " + current));
+            }
+        });
+}
+
+function checkGithubUpdate(manual){
+    if(Vars.headless) return;
+
+    if(!manual){
+        if(_updateChecked) return;
+        _updateChecked = true;
+        const now = Number(System.currentTimeMillis());
+        const last = Number(Core.settings.getLong(UPDATE_LAST_AT_KEY, 0));
+        if(last > 0 && now - last < UPDATE_INTERVAL_MS) return;
+        Core.settings.put(UPDATE_LAST_AT_KEY, now);
+        saveSettingsCompat();
+    }
+
+    resolveLatestRelease(!!manual);
+}
+
+function getUpdateStatusText(){
+    const cur = getCurrentModVersion();
+    const latest = _latestReleaseInfo == null ? "-" : _latestReleaseInfo.version;
+    return "\u5f53\u524d\u7248\u672c: " + cur + "\n\u6700\u65b0\u7248\u672c: " + latest;
 }
 
 function getApprovalCode(){
@@ -1433,7 +1762,7 @@ function rebuildSavedList(container, state, options){
         const uid = getUidShortForUuid8(uuid8);
         const sha1 = getUidSha1ForUuid8(uuid8);
 
-        container.table(Tex.whiteui, row => {
+        container.table(cons(row => {
             row.setColor(Pal.gray);
             row.left();
             row.defaults().pad(4).left();
@@ -1474,7 +1803,7 @@ function rebuildSavedList(container, state, options){
                     if(options && options.rebuild) options.rebuild();
                 });
             }).size(44);
-        }).padBottom(6).growX();
+        })).padBottom(6).growX();
         container.row();
     }
 }
@@ -1646,7 +1975,7 @@ function rebuildRulesList(container, state, rebuild){
         const uid = getUidShortForUuid8(uuid8);
         const sha1 = getUidSha1ForUuid8(uuid8);
 
-        container.table(Tex.whiteui, row => {
+        container.table(cons(row => {
             row.setColor(Pal.gray);
             row.left();
             row.defaults().pad(4).left();
@@ -1671,7 +2000,7 @@ function rebuildRulesList(container, state, rebuild){
                     rebuild();
                 });
             }).size(44);
-        }).padBottom(6).growX();
+        })).padBottom(6).growX();
         container.row();
     }
 }
@@ -1893,6 +2222,12 @@ function addSettingsCategory(){
             return tr("uuidmanager.join.uuid") + ": " + uuid8 + "\n" + tr("uuidmanager.join.uid") + ": " + uid + "\n" + tr("uuidmanager.join.uidsha1") + ": " + sha1;
         }).color(Pal.lightishGray).left().wrap().width(680).row();
 
+        table.add("GitHub \u66f4\u65b0").color(Pal.accent).padTop(10).row();
+        table.label(() => getUpdateStatusText()).color(Pal.lightishGray).left().wrap().width(680).row();
+        table.button("\u68c0\u67e5\u66f4\u65b0", Icon.bookSmall, Styles.cleart, () => {
+            checkGithubUpdate(true);
+        }).height(54).growX().row();
+
         const checkbox = new Packages.arc.scene.ui.CheckBox("@uuidmanager.settings.autoSwitch");
         checkbox.setChecked(!!state.autoSwitch);
         checkbox.changed(() => {
@@ -1983,6 +2318,16 @@ Events.on(ClientLoadEvent, () => {
             addSettingsCategory();
         }catch(e){
             Log.err("[uuidmanager] Failed to add settings category.");
+            Log.err(e);
+        }
+    });
+
+    // Auto-check new GitHub release (throttled by interval).
+    Core.app.post(() => {
+        try{
+            checkGithubUpdate(false);
+        }catch(e){
+            Log.err("[uuidmanager] Auto update check failed.");
             Log.err(e);
         }
     });
