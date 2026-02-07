@@ -172,6 +172,12 @@ function getReleasePageUrl(){
     return "https://github.com/" + UPDATE_OWNER + "/" + UPDATE_REPO + "/releases";
 }
 
+function setHttpTimeout(req, timeoutMs){
+    // Rhino may resolve HttpRequest.timeout to the int field, not the builder method.
+    try{ req.timeout = Number(timeoutMs || 0); }catch(e){ }
+    return req;
+}
+
 function parseLatestRelease(json){
     if(json == null || !json.isObject()) return null;
     const tag = normalizeVersion(json.getString("tag_name", ""));
@@ -269,8 +275,7 @@ function downloadReleaseAsset(rel, asset){
     });
     d.show();
 
-    Http.get(asset.url)
-        .timeout(30000)
+    setHttpTimeout(Http.get(asset.url), 30000)
         .header("User-Agent", "Mindustry")
         .error(e => Core.app.post(() => {
             try{ d.hide(); }catch(err){ }
@@ -372,15 +377,23 @@ function showUpdateDialog(current, rel, fromManual){
     dialog.show();
 }
 
-function resolveLatestRelease(manual){
+function resolveLatestRelease(manual, onDone){
+    const finish = ok => {
+        try{
+            if(typeof onDone === "function") onDone(!!ok);
+        }catch(e){
+            // ignore callback failures
+        }
+    };
+
     const api = getUpdateApiUrl();
-    Http.get(api)
-        .timeout(30000)
+    setHttpTimeout(Http.get(api), 30000)
         .header("User-Agent", "Mindustry")
         .error(e => {
             if(manual){
                 Core.app.post(() => popupInfo("\u68c0\u67e5\u66f4\u65b0\u5931\u8d25"));
             }
+            finish(false);
         })
         .submit(res => {
             let rel = null;
@@ -393,6 +406,7 @@ function resolveLatestRelease(manual){
                 if(manual){
                     Core.app.post(() => popupInfo("\u672a\u80fd\u89e3\u6790\u6700\u65b0\u7248\u672c\u4fe1\u606f"));
                 }
+                finish(false);
                 return;
             }
 
@@ -400,13 +414,17 @@ function resolveLatestRelease(manual){
             const current = getCurrentModVersion();
             const cmp = compareVersions(rel.version, current);
             const ignore = normalizeVersion(Core.settings.getString(UPDATE_IGNORE_KEY, ""));
-            if(!manual && ignore.length > 0 && compareVersions(rel.version, ignore) <= 0) return;
+            if(!manual && ignore.length > 0 && compareVersions(rel.version, ignore) <= 0){
+                finish(true);
+                return;
+            }
 
             if(cmp > 0){
                 Core.app.post(() => showUpdateDialog(current, rel, manual));
             }else if(manual){
                 Core.app.post(() => popupInfo("\u5df2\u662f\u6700\u65b0\u7248\u672c: " + current));
             }
+            finish(true);
         });
 }
 
@@ -419,11 +437,14 @@ function checkGithubUpdate(manual){
         const now = Number(System.currentTimeMillis());
         const last = Number(Core.settings.getLong(UPDATE_LAST_AT_KEY, 0));
         if(last > 0 && now - last < UPDATE_INTERVAL_MS) return;
-        Core.settings.put(UPDATE_LAST_AT_KEY, now);
-        saveSettingsCompat();
     }
 
-    resolveLatestRelease(!!manual);
+    resolveLatestRelease(!!manual, ok => {
+        if(!manual && ok){
+            Core.settings.put(UPDATE_LAST_AT_KEY, Number(System.currentTimeMillis()));
+            saveSettingsCompat();
+        }
+    });
 }
 
 function getUpdateStatusText(){

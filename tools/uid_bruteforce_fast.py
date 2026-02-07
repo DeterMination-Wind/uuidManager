@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import multiprocessing as mp
 import os
@@ -64,7 +65,10 @@ def shortid_from_uuid8_bytes(uuid8: bytes) -> tuple[str, str]:
 
 
 def uid16_to_uuid8(uid16_b64: str) -> str:
-    raw = base64.b64decode(uid16_b64)
+    try:
+        raw = base64.b64decode(uid16_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("输入不是合法Base64 UID") from exc
     if len(raw) != 16:
         raise ValueError("输入不是16字节UID(Base64)")
     uuid8 = base64.b64encode(raw[:8]).decode("ascii")
@@ -72,6 +76,18 @@ def uid16_to_uuid8(uid16_b64: str) -> str:
     if uuid8_bytes_to_uid16_b64(base64.b64decode(uuid8)) != uid16_b64:
         raise ValueError("UID校验失败：不是标准 uuid+crc 格式")
     return uuid8
+
+
+def add_progress(progress: Any, wid: int, value: int) -> None:
+    if value <= 0:
+        return
+    with progress.get_lock():
+        progress[wid] += value
+
+
+def total_progress(progress: Any) -> int:
+    with progress.get_lock():
+        return int(sum(progress))
 
 
 def worker(
@@ -107,18 +123,18 @@ def worker(
         i += workers
 
         if local >= report_every:
-            progress[wid] += local
+            add_progress(progress, wid, local)
             local = 0
 
     if local:
-        progress[wid] += local
+        add_progress(progress, wid, local)
 
 
 def run_bruteforce(target: str, seed: str, max_iter: int, workers: int, report_every: int) -> int:
     seed64 = seed_to_u64(seed)
     stop_event = mp.Event()
     result_q: mp.Queue = mp.Queue()
-    progress = mp.Array("Q", workers, lock=False)
+    progress = mp.Array("Q", workers)
 
     procs = []
     for wid in range(workers):
@@ -154,7 +170,7 @@ def run_bruteforce(target: str, seed: str, max_iter: int, workers: int, report_e
                 pass
 
             alive = any(p.is_alive() for p in procs)
-            checked = sum(progress)
+            checked = total_progress(progress)
             now = time.time()
 
             if now - last_t >= 1.0:
@@ -179,7 +195,7 @@ def run_bruteforce(target: str, seed: str, max_iter: int, workers: int, report_e
                 p.terminate()
 
     elapsed = time.time() - start
-    checked = sum(progress)
+    checked = total_progress(progress)
     if elapsed > 0:
         print(f"done checked={checked:,} elapsed={elapsed:.2f}s avg={checked/elapsed:,.0f}/s")
 
