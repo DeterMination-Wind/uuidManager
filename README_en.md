@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.3.0`
+Current version: `v1.3.1`
 
 ## Features
 
@@ -17,16 +17,23 @@ Current version: `v1.3.0`
   - Query from settings or directly in Join Game after DB build.
 - Built-in GitHub update checker: auto-detects new releases, shows release notes, and supports in-game package download.
 
+## Changelog
+
+### v1.3.1
+
+- Fix an issue where update prompt could fail to appear even when GitHub version is newer.
+- Add a fallback prompt that always provides a direct download link if update dialog creation fails.
+
 ## Install
 
 Import built artifacts into Mindustry mods folder:
 
-- Recommended: `构建/uuidmanager-1.3.0.zip`
-- Alternative: `构建/uuidmanager-1.3.0.jar`
+- Recommended: `构建/uuidmanager-1.3.1.zip`
+- Alternative: `构建/uuidmanager-1.3.1.jar`
 
 ## Build Locally
 
-Run in `uuidManager/`:
+Run in `uuidManager_repo/`:
 
 ```bash
 ./gradlew distAll

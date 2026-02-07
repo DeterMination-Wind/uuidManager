@@ -132,7 +132,13 @@ function normalizeVersion(raw){
 
 function parseVersionParts(v){
     const s = normalizeVersion(v);
-    const m = s.match(/\d+/g);
+    // Only compare numeric core version. Suffixes like "-beta1" are handled separately.
+    let core = s;
+    const dash = core.indexOf("-");
+    if(dash >= 0) core = core.substring(0, dash);
+    const plus = core.indexOf("+");
+    if(plus >= 0) core = core.substring(0, plus);
+    const m = core.match(/\d+/g);
     if(m == null) return [];
     const out = [];
     for(let i = 0; i < m.length; i++){
@@ -140,6 +146,19 @@ function parseVersionParts(v){
         if(!isNaN(n)) out.push(n);
     }
     return out;
+}
+
+function getVersionQualifier(v){
+    const s = normalizeVersion(v);
+    const dash = s.indexOf("-");
+    if(dash < 0 || dash + 1 >= s.length) return "";
+    const plus = s.indexOf("+", dash + 1);
+    const q = plus >= 0 ? s.substring(dash + 1, plus) : s.substring(dash + 1);
+    return ("" + q).trim().toLowerCase();
+}
+
+function isPreReleaseVersion(v){
+    return getVersionQualifier(v).length > 0;
 }
 
 function compareVersions(a, b){
@@ -151,6 +170,17 @@ function compareVersions(a, b){
         const bi = i < pb.length ? pb[i] : 0;
         if(ai !== bi) return ai > bi ? 1 : -1;
     }
+
+    const aPre = isPreReleaseVersion(a);
+    const bPre = isPreReleaseVersion(b);
+    if(aPre !== bPre) return aPre ? -1 : 1;
+
+    if(aPre && bPre){
+        const qa = getVersionQualifier(a);
+        const qb = getVersionQualifier(b);
+        if(qa !== qb) return qa > qb ? 1 : -1;
+    }
+
     return 0;
 }
 
@@ -387,6 +417,19 @@ function showUpdateDialog(current, rel, fromManual){
     dialog.show();
 }
 
+function showUpdateDialogSafe(current, rel, fromManual){
+    try{
+        showUpdateDialog(current, rel, fromManual);
+    }catch(e){
+        Log.err("[uuidmanager] Failed to show update dialog.");
+        Log.err(e);
+
+        const defaultAsset = pickDefaultReleaseAsset(rel);
+        const fallbackUrl = defaultAsset != null && defaultAsset.url ? defaultAsset.url : (rel.htmlUrl || getReleasePageUrl());
+        popupInfo("检测到新版本: " + current + " -> " + rel.version + "\n下载: " + fallbackUrl);
+    }
+}
+
 function resolveLatestRelease(manual, onDone){
     const finish = ok => {
         try{
@@ -430,7 +473,7 @@ function resolveLatestRelease(manual, onDone){
             }
 
             if(cmp > 0){
-                Core.app.post(() => showUpdateDialog(current, rel, manual));
+                Core.app.post(() => showUpdateDialogSafe(current, rel, manual));
             }else if(manual){
                 Core.app.post(() => popupInfo("\u5df2\u662f\u6700\u65b0\u7248\u672c: " + current));
             }

@@ -2,7 +2,7 @@
 
 Mindustry 154.3 客户端侧 UUID/UID 管理模组。
 
-当前版本：`v1.3.0`
+当前版本：`v1.3.1`
 
 ## 功能
 
@@ -17,16 +17,23 @@ Mindustry 154.3 客户端侧 UUID/UID 管理模组。
   - 构建后可在设置中查询，也可在加入游戏界面直接查库。
 - 内置 GitHub 更新检测：自动检查新版本、显示更新说明，并支持在游戏内下载更新包。
 
+## 更新日志
+
+### v1.3.1
+
+- 修复 GitHub 最新版本高于本地时，部分情况下不会弹出更新提示的问题。
+- 增加更新提示兜底逻辑：即使更新弹窗异常，也会给出可直接打开的下载链接。
+
 ## 安装
 
 将 `zip` 或 `jar` 产物导入 Mindustry 模组目录：
 
-- 推荐：`构建/uuidmanager-1.3.0.zip`
-- 备用：`构建/uuidmanager-1.3.0.jar`
+- 推荐：`构建/uuidmanager-1.3.1.zip`
+- 备用：`构建/uuidmanager-1.3.1.jar`
 
 ## 本地构建
 
-在 `uuidManager/` 目录执行：
+在 `uuidManager_repo/` 目录执行：
 
 ```bash
 ./gradlew distAll
