@@ -45,7 +45,7 @@ jobs:
           {
             echo "## UUID Manager v${{ steps.version.outputs.version }}"
             echo
-            echo "### Changelog"
+            echo "### 更新日志"
             if [ -n "$prev_tag" ]; then
               git log --no-merges --pretty=format:'- %s (%h)' "$prev_tag..${GITHUB_REF_NAME}" || true
             else
@@ -53,8 +53,8 @@ jobs:
             fi
             echo
             echo
-            echo "### Build"
-            echo "- Mindustry min version: 154"
+            echo "### 构建信息"
+            echo "- Mindustry 最低版本: 154"
           } > RELEASE_NOTES.md
 
       - name: Upload artifacts

@@ -55,6 +55,8 @@ const UPDATE_MOD_NAME = "uuidmanager";
 const UPDATE_IGNORE_KEY = "uuidmanager.update.ignore";
 const UPDATE_LAST_AT_KEY = "uuidmanager.update.lastAt";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const IMPORT_MAX_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_SANITIZE_TEXT_LENGTH = 4096;
 const APPROVAL_CODE_XOR = [
     9, 43, 43, 190, 197, 232, 139, 156, 130, 163, 48, 126,
     67, 127, 37, 44, 9, 21, 188, 220, 205, 135, 169, 148,
@@ -952,6 +954,13 @@ function importUidDbFromFile(pathText){
     const fi = new Fi(path);
     if(!fi.exists()) return {ok: false, message: "\u6587\u4ef6\u4e0d\u5b58\u5728"};
 
+    const bytes = Number(fi.length());
+    if(bytes > IMPORT_MAX_FILE_BYTES){
+        const mb = Strings.autoFixed(bytes / 1024 / 1024, 1);
+        const maxMb = Strings.autoFixed(IMPORT_MAX_FILE_BYTES / 1024 / 1024, 0);
+        return {ok: false, message: "\u6587\u4ef6\u8fc7\u5927(" + mb + "MB)\uff0c\u8d85\u8fc7\u5bfc\u5165\u4e0a\u9650(" + maxMb + "MB)"};
+    }
+
     try{
         const text = fi.readString();
         return importUidDbText(text);
@@ -1021,8 +1030,40 @@ function lookupUuid8ByUid(uid3){
 
 function sanitizeIdText(text){
     if(text == null) return "";
-    // remove whitespace (users often copy/paste with newlines)
-    return ("" + text).trim().replace(/\s+/g, "");
+
+    // Avoid expensive coercion on malformed objects/arrays from imports.
+    if(Array.isArray(text)) return "";
+    const t = typeof text;
+    if(t === "object"){
+        try{
+            if(Object.prototype.toString.call(text) === "[object Object]") return "";
+        }catch(e){
+            return "";
+        }
+    }
+
+    let s = "";
+    try{
+        s = "" + text;
+    }catch(e){
+        return "";
+    }
+    if(s.length === 0) return "";
+    if(s.length > MAX_SANITIZE_TEXT_LENGTH) return "";
+
+    // Manually strip whitespace to avoid Rhino regexp OOM on very long inputs.
+    const out = [];
+    let changed = false;
+    for(let i = 0; i < s.length; i++){
+        const c = s.charCodeAt(i);
+        const ws = (c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 32 || c === 160);
+        if(ws){
+            changed = true;
+            continue;
+        }
+        out.push(s.charAt(i));
+    }
+    return changed ? out.join("") : s;
 }
 
 function padBase64(text){
@@ -1351,7 +1392,7 @@ function buildUidDbAll8s(onDone, onProgress){
     waiterThread.start();
 }
 
-function tryCollectImportedPairsFromObject(obj, out){
+function tryCollectImportedPairsFromObject(obj, onPair){
     if(obj == null || typeof obj !== "object") return;
 
     if(Array.isArray(obj)){
@@ -1364,7 +1405,7 @@ function tryCollectImportedPairsFromObject(obj, out){
             const uid = normalizeUidKey(it.uid3 || it.uid || it.id || it.shortId || it.shortid || "");
             const raw = it.uuid8 || it.uuid || it.longUuid || it.longuuid || it.value || "";
             if(uid.length === 3 && ("" + raw).length > 0){
-                out.push({uid: uid, raw: "" + raw});
+                onPair(uid, "" + raw);
             }
         }
         return;
@@ -1378,13 +1419,13 @@ function tryCollectImportedPairsFromObject(obj, out){
             if(uid.length !== 3) continue;
             const vals = uidListFromRaw(mp[k]);
             for(let i = 0; i < vals.length; i++){
-                out.push({uid: uid, raw: vals[i]});
+                onPair(uid, vals[i]);
             }
         }
     }
 }
 
-function tryCollectImportedPairsFromLines(text, out){
+function tryCollectImportedPairsFromLines(text, onPair){
     const lines = ("" + text).split(/\r?\n/);
     for(let i = 0; i < lines.length; i++){
         const ln = lines[i].trim();
@@ -1401,7 +1442,7 @@ function tryCollectImportedPairsFromLines(text, out){
         const uid = normalizeUidKey(m[1]);
         const raw = sanitizeIdText(m[2]);
         if(uid.length !== 3 || raw.length === 0) continue;
-        out.push({uid: uid, raw: raw});
+        onPair(uid, raw);
     }
 }
 
@@ -1411,22 +1452,11 @@ function importUidDbText(payload){
         return {ok: false, message: "\u7c98\u8d34\u677f\u4e3a\u7a7a"};
     }
 
-    const pairs = [];
     let jsonObj = null;
     try{
         jsonObj = JSON.parse(text);
     }catch(e){
         jsonObj = null;
-    }
-
-    if(jsonObj != null){
-        tryCollectImportedPairsFromObject(jsonObj, pairs);
-    }else{
-        tryCollectImportedPairsFromLines(text, pairs);
-    }
-
-    if(pairs.length === 0){
-        return {ok: false, message: "\u672a\u8bc6\u522b\u5230\u53ef\u5bfc\u5165\u8bb0\u5f55"};
     }
 
     const db = loadUidDb();
@@ -1435,26 +1465,37 @@ function importUidDbText(payload){
     let invalid = 0;
     let mismatch = 0;
 
-    for(let i = 0; i < pairs.length; i++){
-        const p = pairs[i];
-        const norm = normalizeUuidOrUid(p.raw);
+    let totalParsed = 0;
+    const consume = (uid, raw) => {
+        totalParsed++;
+        const norm = normalizeUuidOrUid(raw);
         if(!norm.valid){
             invalid++;
-            continue;
+            return;
         }
 
         const uuid8 = norm.uuid8;
         const sid = getUidShortForUuid8(uuid8);
-        if(sid !== p.uid){
+        if(sid !== uid){
             mismatch++;
-            continue;
+            return;
         }
 
-        if(addUidPair(db, p.uid, uuid8)){
+        if(addUidPair(db, uid, uuid8)){
             added++;
         }else{
             duplicate++;
         }
+    };
+
+    if(jsonObj != null){
+        tryCollectImportedPairsFromObject(jsonObj, consume);
+    }else{
+        tryCollectImportedPairsFromLines(text, consume);
+    }
+
+    if(totalParsed === 0){
+        return {ok: false, message: "\u672a\u8bc6\u522b\u5230\u53ef\u5bfc\u5165\u8bb0\u5f55"};
     }
 
     recomputeUidDbMeta(db, {
@@ -1472,7 +1513,7 @@ function importUidDbText(payload){
         duplicate: duplicate,
         invalid: invalid,
         mismatch: mismatch,
-        totalParsed: pairs.length,
+        totalParsed: totalParsed,
         message: saved ? "\u5bfc\u5165\u5b8c\u6210" : "\u5bfc\u5165\u6210\u529f\u4f46\u4fdd\u5b58\u5931\u8d25"
     };
 }

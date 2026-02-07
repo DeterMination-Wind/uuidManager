@@ -2,7 +2,7 @@
 
 Mindustry 154.3 客户端侧 UUID/UID 管理模组。
 
-当前版本：`v1.2.0`
+当前版本：`v1.2.4`
 
 ## 功能
 
@@ -21,8 +21,8 @@ Mindustry 154.3 客户端侧 UUID/UID 管理模组。
 
 将 `zip` 或 `jar` 产物导入 Mindustry 模组目录：
 
-- 推荐：`构建/uuidmanager-1.2.0.zip`
-- 备用：`构建/uuidmanager-1.2.0.jar`
+- 推荐：`构建/uuidmanager-1.2.4.zip`
+- 备用：`构建/uuidmanager-1.2.4.jar`
 
 ## 本地构建
 
