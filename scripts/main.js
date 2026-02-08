@@ -51,10 +51,14 @@ const UID_DB_KEY = "uuidmanager.uiddb";
 const UID_DB_FILE = "uuidmanager.uiddb.json";
 const UID_DB_SHARD_PREFIX = "uuidmanager.uiddb.part-";
 const UID_DB_SHARD_SUFFIX = ".json";
-const UID_DB_SHARD_BYTES = 64 * 1024 * 1024;
+const UID_DB_SHARD_BYTES = 8 * 1024 * 1024;
 const UID_BUILD_ROUNDS_KEY = "uuidmanager.uiddb.buildRounds";
 const UID_BUILD_MAX_ROUNDS = 99;
 const UID_BUILD_MAX_ITER = 5000000;
+const UID_BUILD_MAX_FOUND_PER_ROUND = 50000;
+const UID_BUILD_MIN_FREE_BYTES = 160 * 1024 * 1024;
+const UID_MAX_VALUES_PER_KEY = 6;
+const UID_MAX_SCAN_PER_KEY = 256;
 const APPROVED_KEY = "uuidmanager.approved";
 const JOIN_ROW_NAME = "uuidmanager-join-row";
 const UPDATE_OWNER = "DeterMination-Wind";
@@ -769,13 +773,22 @@ function normalizeUidKey(uid3){
 }
 
 function uidListFromRaw(raw){
+    const maxValues = Math.max(1, Number(UID_MAX_VALUES_PER_KEY || 1));
+    const maxScan = Math.max(maxValues, Number(UID_MAX_SCAN_PER_KEY || maxValues));
     const out = [];
     if(raw == null) return out;
 
     if(Array.isArray(raw)){
-        for(let i = 0; i < raw.length; i++){
+        const seen = {};
+        let scanned = 0;
+        for(let i = 0; i < raw.length && scanned < maxScan; i++){
+            scanned++;
             const v = sanitizeIdText(raw[i]);
-            if(v.length > 0) out.push(v);
+            if(v.length === 0) continue;
+            if(Object.prototype.hasOwnProperty.call(seen, v)) continue;
+            seen[v] = true;
+            out.push(v);
+            if(out.length >= maxValues) break;
         }
         return out;
     }
@@ -785,12 +798,22 @@ function uidListFromRaw(raw){
     return out;
 }
 
+function compactUidValue(list){
+    if(!Array.isArray(list) || list.length === 0) return null;
+    if(list.length === 1) return list[0];
+    return list;
+}
+
 function ensureUidList(db, key){
     const k = normalizeUidKey(key);
     if(k.length !== 3) return [];
 
     let list = db.map[k];
-    if(Array.isArray(list)) return list;
+    if(Array.isArray(list)){
+        list = uidListFromRaw(list);
+        db.map[k] = list;
+        return list;
+    }
 
     list = uidListFromRaw(list);
     db.map[k] = list;
@@ -802,11 +825,31 @@ function addUidPair(db, uid3, uuid8){
     const val = sanitizeIdText(uuid8);
     if(key.length !== 3 || val.length === 0) return false;
 
-    const list = ensureUidList(db, key);
-    for(let i = 0; i < list.length; i++){
-        if(list[i] === val) return false;
+    const raw = db.map[key];
+    if(raw == null){
+        db.map[key] = val;
+        return true;
     }
-    list.push(val);
+
+    if(Array.isArray(raw)){
+        const list = ensureUidList(db, key);
+        for(let i = 0; i < list.length; i++){
+            if(list[i] === val) return false;
+        }
+        if(list.length >= UID_MAX_VALUES_PER_KEY) return false;
+        list.push(val);
+        db.map[key] = compactUidValue(list);
+        return true;
+    }
+
+    const one = sanitizeIdText(raw);
+    if(one.length === 0){
+        db.map[key] = val;
+        return true;
+    }
+    if(one === val) return false;
+    if(UID_MAX_VALUES_PER_KEY <= 1) return false;
+    db.map[key] = [one, val];
     return true;
 }
 
@@ -817,7 +860,11 @@ function getUidListByUid(uid3){
 
     const db = loadUidDb();
     const raw = db.map[key];
-    if(Array.isArray(raw)) return raw;
+    if(Array.isArray(raw)){
+        const list = uidListFromRaw(raw);
+        db.map[key] = compactUidValue(list);
+        return list;
+    }
     return uidListFromRaw(raw);
 }
 
@@ -831,9 +878,14 @@ function recomputeUidDbMeta(db, patch){
         const key = targetInfo.targets[i];
         const list = uidListFromRaw(db.map[key]);
         if(list.length > 0){
+            if(list.length > UID_MAX_VALUES_PER_KEY){
+                list.length = UID_MAX_VALUES_PER_KEY;
+            }
             foundCount++;
             longIdCount += list.length;
-            db.map[key] = list;
+            db.map[key] = compactUidValue(list);
+        }else if(db.map[key] != null){
+            try{ delete db.map[key]; }catch(e){ db.map[key] = null; }
         }
     }
 
@@ -930,22 +982,11 @@ function collectUidDbEntriesForSave(db){
         const list = uidListFromRaw(db.map[uid]);
         if(list.length === 0) continue;
 
-        const sorted = list.slice().sort();
-        const uniq = [];
-        let last = null;
-        for(let j = 0; j < sorted.length; j++){
-            const v = sorted[j];
-            if(v === last) continue;
-            uniq.push(v);
-            last = v;
-        }
-        if(uniq.length === 0) continue;
-
         // Keep each uid entry chunk under the shard limit so one hot key cannot overflow a shard.
         let part = [];
         let partBytes = 64;
-        for(let j = 0; j < uniq.length; j++){
-            const val = uniq[j];
+        for(let j = 0; j < list.length; j++){
+            const val = list[j];
             const valBytes = utf8ByteLength(JSON.stringify(val)) + 2;
             if(part.length > 0 && partBytes + valBytes > maxEntryBytes){
                 const estA = utf8ByteLength(JSON.stringify(uid)) + utf8ByteLength(JSON.stringify(part)) + 24;
@@ -1755,8 +1796,9 @@ function buildUidDbAllOnce(maxIter, roundSeed, onDone, onProgress){
     const checked = new AtomicLong(0);
     const finished = new AtomicInteger(0);
     const step = 50000;
-    const maxFoundPairs = 200000;
+    const maxFoundPairs = UID_BUILD_MAX_FOUND_PER_ROUND;
     const foundPairs = new ConcurrentHashMap();
+    const stoppedByMemory = new AtomicBoolean(false);
 
     for(let wid = 0; wid < cores; wid++){
         const workerId = wid;
@@ -1771,6 +1813,19 @@ function buildUidDbAllOnce(maxIter, roundSeed, onDone, onProgress){
 
                     // Spread iterations across workers so total attempts ~= maxTotal.
                     for(let i = workerId; i < maxTotal; i += cores){
+                        if((localChecked & 4095) === 0){
+                            try{
+                                const rt = Runtime.getRuntime();
+                                const free = Number(rt.maxMemory() - (rt.totalMemory() - rt.freeMemory()));
+                                if(free > 0 && free < UID_BUILD_MIN_FREE_BYTES){
+                                    stoppedByMemory.set(true);
+                                    break;
+                                }
+                            }catch(e){
+                                // ignore memory probe failure
+                            }
+                        }
+
                         rng.nextBytes(uuidBytes);
                         const uidBytes = computeUidBytesFromUuidBytes(uuidBytes);
                         if(uidBytes == null) continue;
@@ -1780,8 +1835,7 @@ function buildUidDbAllOnce(maxIter, roundSeed, onDone, onProgress){
                         if(sid.length === 3 && !isAllSpecialUid(sid)){
                             // Keep memory bounded; DB merge happens after a round.
                             if(foundPairs.size() < maxFoundPairs){
-                                const pairKey = sid + "|" + b64Encode(uuidBytes);
-                                foundPairs.putIfAbsent(pairKey, true);
+                                foundPairs.putIfAbsent(sid, b64Encode(uuidBytes));
                             }
                         }
 
@@ -1835,7 +1889,8 @@ function buildUidDbAllOnce(maxIter, roundSeed, onDone, onProgress){
                             checked: finalChecked,
                             total: maxTotal,
                             cores: cores,
-                            foundPairs: foundPairs
+                            foundPairs: foundPairs,
+                            stoppedByMemory: !!stoppedByMemory.get()
                         });
                     }catch(e){
                         Log.err(e);
@@ -1895,6 +1950,7 @@ function buildUidDbRounds(rounds, onDone, onProgress){
     let totalChecked = 0;
     let totalAddedPairs = 0;
     let coresUsed = 1;
+    let stoppedByMemory = false;
 
     const emit = (stage, percent) => {
         if(typeof onProgress !== "function") return;
@@ -1917,13 +1973,12 @@ function buildUidDbRounds(rounds, onDone, onProgress){
             // Merge new pairs into local DB (always additive).
             let addedPairs = 0;
             try{
-                const iter = result.foundPairs.keySet().iterator();
+                const iter = result.foundPairs.entrySet().iterator();
                 while(iter.hasNext()){
-                    const pair = "" + iter.next();
-                    const sep = pair.indexOf("|");
-                    if(sep <= 0 || sep >= pair.length - 1) continue;
-                    const k = pair.substring(0, sep);
-                    const v = pair.substring(sep + 1);
+                    const e = iter.next();
+                    const k = normalizeUidKey(e.getKey());
+                    const v = sanitizeIdText(e.getValue());
+                    if(k.length !== 3 || v.length === 0) continue;
                     if(addUidPair(db, k, v)) addedPairs++;
                 }
             }catch(e){
@@ -1931,10 +1986,14 @@ function buildUidDbRounds(rounds, onDone, onProgress){
             }
             totalAddedPairs += addedPairs;
 
+            if(result.stoppedByMemory){
+                stoppedByMemory = true;
+            }
+
             const overallPercent = Math.floor((totalChecked / totalIter) * 100);
             emit("bruteforce", overallPercent);
 
-            if(roundIndex < nRounds){
+            if(roundIndex < nRounds && !stoppedByMemory){
                 roundIndex++;
                 Core.app.post(runRound);
                 return;
@@ -1953,12 +2012,13 @@ function buildUidDbRounds(rounds, onDone, onProgress){
                         db.meta.lastBuildSec = Math.max(1, Math.floor((Number(System.currentTimeMillis()) - startedAt) / 1000));
                         db.meta.lastBuildRounds = nRounds;
                         db.meta.lastAddedPairs = totalAddedPairs;
+                        db.meta.lastStoppedByMemory = stoppedByMemory ? 1 : 0;
 
                         const saved = saveUidDb(db);
                         _uidBuildRunning = false;
                         if(typeof onDone === "function"){
                             Core.app.post(() => {
-                                try{ onDone({ok: saved, meta: db.meta}); }catch(e){ }
+                                try{ onDone({ok: saved, meta: db.meta, stoppedByMemory: stoppedByMemory}); }catch(e){ }
                             });
                         }
                     }catch(e){
@@ -2178,7 +2238,7 @@ function showUidBruteforceProgressDialog(){
             return;
         }
         const m = result.meta;
-        popupInfo("\u6784\u5efa\u5b8c\u6210\n\u77edUID\u8986\u76d6: " + m.foundCount + "/" + m.targetCount + "\n\u957fid\u603b\u6570: " + (m.longIdCount || 0));
+        popupInfo("\u6784\u5efa\u5b8c\u6210" + (result.stoppedByMemory ? "(\u4f4e\u5185\u5b58\u63d0\u524d\u505c\u6b62)" : "") + "\n\u77edUID\u8986\u76d6: " + m.foundCount + "/" + m.targetCount + "\n\u957fid\u603b\u6570: " + (m.longIdCount || 0));
     }, prog => {
         const p = Math.max(0, Math.min(100, Number(prog && prog.percent ? prog.percent : 0)));
         progressValue = p / 100;

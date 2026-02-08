@@ -2,7 +2,7 @@
 
 Client-side UUID/UID manager for Mindustry 154.3.
 
-Current version: `v1.4.1`
+Current version: `v1.4.2`
 
 ## Features
 
@@ -18,6 +18,11 @@ Current version: `v1.4.1`
 - Built-in GitHub update checker: auto-detects new releases, shows release notes, and supports in-game package download.
 
 ## Changelog
+
+### v1.4.2
+
+- Further fix OOM risk in the post-bruteforce save phase by reducing shard write peak usage and capping per-UID saved values.
+- Improve large DB compaction/cleanup to reduce crash risk from historical oversized data.
 
 ### v1.4.1
 
@@ -45,8 +50,8 @@ Current version: `v1.4.1`
 
 Import built artifacts into Mindustry mods folder:
 
-- Recommended: `构建/uuidmanager-1.4.1.zip`
-- Alternative: `构建/uuidmanager-1.4.1.jar`
+- Recommended: `构建/uuidmanager-1.4.2.zip`
+- Alternative: `构建/uuidmanager-1.4.2.jar`
 
 ## Build Locally
 
